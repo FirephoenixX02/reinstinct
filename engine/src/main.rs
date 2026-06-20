@@ -208,11 +208,10 @@ enum Command {
         /// Context window (prompt + generated tokens) per request.
         #[arg(long, default_value_t = 4096)]
         max_seq: usize,
-        /// Default max generated tokens per request (overridable per-request).
-        /// Raised from 256 to accommodate reasoning models that spend tokens
-        /// on thinking before answering. Capped per-request by remaining
-        /// context window (max_seq − prompt tokens).
-        #[arg(long, default_value_t = 4096)]
+        /// Default max generated tokens per request (deprecated — server now
+        /// auto-uses the full remaining context window when max_tokens is
+        /// not specified per-request). Kept for backward compatibility.
+        #[arg(long, default_value_t = 4096, hide = true)]
         default_max_tokens: usize,
     },
     /// QMTP-1 diagnostic: load a Qwen 3.6 MTP model, prefill a prompt,
@@ -348,12 +347,12 @@ fn main() -> anyhow::Result<()> {
         Command::Bench { path, iters, token } => bench(&path, iters, token),
         Command::HipInfo { mb, iters } => hip_info(mb, iters),
         Command::GpuBench { path, iters, token } => gpu_bench(&path, iters, token),
-        Command::Serve { big, big_drafter, small, embed,
-                          big_port, small_port, embed_port, max_seq,
-                          default_max_tokens } =>
-             reinstinct_serve::run(big, big_drafter, small, embed,
-                                           big_port, small_port, embed_port,
-                                           max_seq, default_max_tokens)
+     Command::Serve { big, big_drafter, small, embed,
+                           big_port, small_port, embed_port, max_seq,
+                           .. } =>
+              reinstinct_serve::run(big, big_drafter, small, embed,
+                                            big_port, small_port, embed_port,
+                                            max_seq)
                  .map_err(anyhow::Error::msg),
         Command::GenerateText { path, prompt, system, user, tokens, steps,
                                 temperature, top_k, seed, gpu } =>

@@ -245,13 +245,13 @@ const CHAT_DEFAULTS: SamplerDefaults = SamplerDefaults {
     repetition_penalty: 1.1, frequency_penalty: 0.1,
 };
 
-fn parse_common_fields(j: &Json, defaults: SamplerDefaults, default_max_tokens: usize)
+ fn parse_common_fields(j: &Json, defaults: SamplerDefaults)
     -> (usize, reinstinct_sampling::SamplerParams, Option<bool>, Option<usize>, f32,
         Option<std::time::Duration>, bool, bool, usize)
 {
     use reinstinct_sampling::{SamplerParams, MirostatV2};
     let max_tokens = j.get("max_tokens").and_then(Json::as_f64)
-        .map(|n| n as usize).unwrap_or(default_max_tokens).max(1);
+        .map(|n| n as usize).unwrap_or(0); // 0 = use full remaining context window
 
     let mut sp = SamplerParams::default();
     sp.temperature = j.get("temperature").and_then(Json::as_f64)
@@ -440,7 +440,7 @@ fn render_text_logprobs(lp: &[TokenLogprob]) -> Json {
 
 /// Parse an OpenAI `/v1/completions` body into a `GenReq`. Raw-prompt
 /// path; no chat template is applied server-side.
-fn parse_completions(body: &str, default_max_tokens: usize) -> Result<GenReq, (u16, &'static str, String)> {
+fn parse_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> {
     let bad = |m: String| (400u16, "Bad Request", m);
     let j = Json::parse(body).map_err(|e| bad(format!("invalid JSON: {e}")))?;
     let prompt = j.get("prompt").and_then(Json::as_str)
@@ -448,7 +448,7 @@ fn parse_completions(body: &str, default_max_tokens: usize) -> Result<GenReq, (u
         .to_string();
     let (max_tokens, sampler, use_speculative, speculative_k, speculative_p_min,
          request_timeout, stream, stream_include_usage, top_logprobs_n) =
-        parse_common_fields(&j, COMPLETION_DEFAULTS, default_max_tokens);
+        parse_common_fields(&j, COMPLETION_DEFAULTS);
     Ok(GenReq { prompt: PromptInput::Raw(prompt), max_tokens, sampler,
                 use_speculative, speculative_k, speculative_p_min,
                 request_timeout, stream, stream_include_usage, top_logprobs_n })
@@ -457,7 +457,7 @@ fn parse_completions(body: &str, default_max_tokens: usize) -> Result<GenReq, (u
 /// Parse an OpenAI `/v1/chat/completions` body into a `GenReq`. The
 /// `messages` array becomes a `PromptInput::Chat`; the worker's
 /// model knows which per-architecture chat template to apply.
-fn parse_chat_completions(body: &str, default_max_tokens: usize) -> Result<GenReq, (u16, &'static str, String)> {
+fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> {
     use reinstinct_chat::{ChatMessage, Role};
     let bad = |m: String| (400u16, "Bad Request", m);
     let j = Json::parse(body).map_err(|e| bad(format!("invalid JSON: {e}")))?;
@@ -487,7 +487,7 @@ fn parse_chat_completions(body: &str, default_max_tokens: usize) -> Result<GenRe
     }
     let (max_tokens, sampler, use_speculative, speculative_k, speculative_p_min,
          request_timeout, stream, stream_include_usage, top_logprobs_n) =
-        parse_common_fields(&j, CHAT_DEFAULTS, default_max_tokens);
+        parse_common_fields(&j, CHAT_DEFAULTS);
     Ok(GenReq { prompt: PromptInput::Chat(messages), max_tokens, sampler,
                 use_speculative, speculative_k, speculative_p_min,
                 request_timeout, stream, stream_include_usage, top_logprobs_n })
@@ -960,7 +960,9 @@ impl ServerModel {
                 }
                 // Clamp max_tokens to remaining context window (safety margin 4).
                 let remaining = (*max_seq).saturating_sub(prompt.len()).saturating_sub(4);
-                let effective_max_tokens = if req.max_tokens > remaining {
+                let effective_max_tokens = if req.max_tokens == 0 {
+                    remaining
+                } else if req.max_tokens > remaining {
                     warn!("max_tokens={} clamped to {} (prompt={}, context={})",
                          req.max_tokens, remaining, prompt.len(), *max_seq);
                     remaining
@@ -1038,7 +1040,9 @@ impl ServerModel {
                 }
                 // Clamp max_tokens to remaining context window (safety margin 8).
                 let remaining_g = (*max_seq).saturating_sub(prompt.len()).saturating_sub(8);
-                let effective_max_tokens_g = if req.max_tokens > remaining_g {
+                let effective_max_tokens_g = if req.max_tokens == 0 {
+                    remaining_g
+                } else if req.max_tokens > remaining_g {
                     warn!("max_tokens={} clamped to {} (prompt={}, context={})",
                          req.max_tokens, remaining_g, prompt.len(), *max_seq);
                     remaining_g
@@ -1504,7 +1508,7 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
 
 fn handle_conn(mut stream: std::net::TcpStream, target: Target,
                 tx: mpsc::Sender<Job>, metrics: Arc<Metrics>,
-                model_name: Arc<String>, default_max_tokens: usize)
+                model_name: Arc<String>)
 {
     let request_id = metrics.requests_total.fetch_add(1, Ordering::Relaxed) + 1;
     let request = match http::read_request(&stream) {
@@ -1600,8 +1604,8 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
                 top_logprobs_n: 0,
             })
         }
-        Some("chat") => parse_chat_completions(&request.body, default_max_tokens),
-        Some("completions") => parse_completions(&request.body, default_max_tokens),
+        Some("chat") => parse_chat_completions(&request.body),
+        Some("completions") => parse_completions(&request.body),
         Some(other) => unreachable!("unknown route tag {other}"),
     };
 
@@ -1664,7 +1668,7 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
 }
 
 fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
-             metrics: Arc<Metrics>, model_name: Arc<String>, default_max_tokens: usize) {
+             metrics: Arc<Metrics>, model_name: Arc<String>) {
     let listener = match std::net::TcpListener::bind(("0.0.0.0", port)) {
         Ok(l) => l,
         Err(e) => { error!("FATAL: cannot bind port {port}: {e}"); return; }
@@ -1676,7 +1680,7 @@ fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
                 let tx = tx.clone();
                 let metrics = Arc::clone(&metrics);
                 let model_name = Arc::clone(&model_name);
-                thread::spawn(move || handle_conn(stream, target, tx, metrics, model_name, default_max_tokens));
+                thread::spawn(move || handle_conn(stream, target, tx, metrics, model_name));
             }
             Err(e) => warn!("accept error on :{port}: {e}"),
         }
@@ -1684,10 +1688,10 @@ fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
 }
 
 /// Start the three-port multi-model server. Blocks forever.
- pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
-            small: Option<PathBuf>, embed: Option<PathBuf>,
-            big_port: u16, small_port: u16, embed_port: u16,
-            max_seq: usize, default_max_tokens: usize)
+    pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
+             small: Option<PathBuf>, embed: Option<PathBuf>,
+             big_port: u16, small_port: u16, embed_port: u16,
+             max_seq: usize)
     -> Result<(), String>
 {
     // Surface any REINSTINCT_* env vars at startup. Several of them are
@@ -1766,9 +1770,8 @@ fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
     for (port, target, name) in acceptors {
         let tx = tx.clone();
         let metrics = Arc::clone(&metrics);
-        let max_tok = default_max_tokens;
         thread::Builder::new().name(format!("accept-{}", target.label()))
-            .spawn(move || acceptor(port, target, tx, metrics, name, max_tok))
+            .spawn(move || acceptor(port, target, tx, metrics, name))
             .map_err(|e| e.to_string())?;
     }
     drop(tx);   // only the acceptors hold senders now
@@ -1785,7 +1788,7 @@ mod logprobs_tests {
         // tuple positions 0..8: max_tokens, sampler, use_speculative,
         // speculative_k, speculative_p_min, request_timeout, stream,
         // stream_include_usage, top_logprobs_n  (← .8)
-         parse_common_fields(&Json::parse(body).unwrap(), COMPLETION_DEFAULTS, 256).8
+         parse_common_fields(&Json::parse(body).unwrap(), COMPLETION_DEFAULTS).8
     }
 
     #[test]
