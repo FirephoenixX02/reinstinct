@@ -232,6 +232,76 @@ impl Tokenizer {
 
         String::from_utf8_lossy(&bytes).into_owned()
     }
+
+    /// Decode token ids, but only emit the valid UTF-8 prefix of the
+    /// resulting byte stream. Incomplete multi-byte sequences at the
+    /// tail are silently dropped. Use this for streaming output so that
+    /// replacement characters (U+FFFD) are never emitted for partial
+    /// emoji or other multi-byte glyphs.
+    pub fn decode_utf8(&self, ids: &[u32]) -> String {
+        let mut joined = String::new();
+        for &id in ids {
+            joined.push_str(self.token_str(id));
+        }
+
+        let mut bytes: Vec<u8> = Vec::with_capacity(joined.len());
+        for c in joined.chars() {
+            if let Some(&b) = self.byte_decoder.get(&c) {
+                bytes.push(b);
+            } else {
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
+                bytes.extend_from_slice(s.as_bytes());
+            }
+        }
+
+        let valid_len = valid_utf8_prefix_len(&bytes);
+        String::from_utf8(bytes[..valid_len].to_vec()).unwrap_or_default()
+    }
+}
+
+/// Return the byte length of the longest valid UTF-8 prefix of `bytes`.
+fn valid_utf8_prefix_len(bytes: &[u8]) -> usize {
+    let mut i = 0;
+    while i < bytes.len() {
+        let valid = bytes[i..].iter().position(|&b| {
+            match b {
+                0x00..=0x7F => false,
+                0xC0..=0xDF => true,
+                0xE0..=0xEF => true,
+                0xF0..=0xF7 => true,
+                _ => true, // continuation or invalid byte
+            }
+        });
+        if let Some(pos) = valid {
+            let lead = bytes[i + pos];
+            let expected = match lead {
+                0xC0..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF7 => 4,
+                _ => return i + pos, // invalid byte
+            };
+            let remaining = bytes[i + pos..].len();
+            if remaining < expected {
+                return i + pos; // incomplete sequence
+            }
+            // Check continuation bytes
+            let mut valid_seq = true;
+            for j in 1..expected {
+                if bytes[i + pos + j] & 0xC0 != 0x80 {
+                    valid_seq = false;
+                    break;
+                }
+            }
+            if !valid_seq {
+                return i + pos; // invalid continuation
+            }
+            i += pos + expected;
+        } else {
+            return bytes.len(); // all remaining bytes are valid ASCII
+        }
+    }
+    bytes.len()
 }
 
 /// SentencePiece-style BPE tokenizer for Gemma 4 (`tokenizer.ggml.model
@@ -394,6 +464,29 @@ impl GemmaTokenizer {
             }
         }
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Decode ids, but only emit the valid UTF-8 prefix (no replacement
+    /// chars for incomplete multi-byte sequences). Use for streaming.
+    pub fn decode_utf8(&self, ids: &[u32]) -> String {
+        let mut bytes: Vec<u8> = Vec::new();
+        for &id in ids {
+            if let Some(&b) = self.id_to_byte.get(&id) {
+                bytes.push(b);
+                continue;
+            }
+            let Some(s) = self.tokens.get(id as usize) else { continue };
+            for ch in s.chars() {
+                if ch == METASPACE {
+                    bytes.push(b' ');
+                } else {
+                    let mut buf = [0u8; 4];
+                    bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+        }
+        let valid_len = valid_utf8_prefix_len(&bytes);
+        String::from_utf8(bytes[..valid_len].to_vec()).unwrap_or_default()
     }
 }
 

@@ -952,20 +952,16 @@ impl ServerModel {
                     if !counts.is_empty() { counts[t as usize] = counts[t as usize].saturating_add(1); }
                     // Re-decode the whole output: append-only token streams
                     // mean the previous prefix bytes are stable, so the
-                    // delta is the suffix past prev_text_len. Multi-token
-                    // unicode glyphs render correctly because we only emit
-                    // bytes once the trailing token completes them.
-                    full_text = tok.decode(&out);
+                    // delta is the suffix past prev_text_len. Using
+                    // decode_utf8 drops incomplete multi-byte sequences
+                    // at the tail so replacement characters are never
+                    // emitted for partial emoji or other glyphs.
+                    full_text = tok.decode_utf8(&out);
                     let tlp = if want_lp > 0 {
                         Some(decode_token_logprob(|ids| tok.decode(ids), t, &res))
                     } else { None };
                     if full_text.len() > prev_text_len {
-                        let safe_offset = full_text.char_indices()
-                            .rev()
-                            .find(|&(i, _)| i <= prev_text_len)
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        let delta = &full_text[safe_offset..];
+                        let delta = &full_text[prev_text_len..];
                         let ok = on_token(delta, tlp.as_ref());
                         if let Some(t) = tlp { all_lp.push(t); }
                         if !ok {
@@ -1081,17 +1077,12 @@ impl ServerModel {
                         if !counts.is_empty() {
                             counts[t as usize] = counts[t as usize].saturating_add(1);
                         }
-                        full_text = tok.decode(&out);
+                        full_text = tok.decode_utf8(&out);
                         let tlp = if want_lp > 0 {
                             Some(decode_token_logprob(|ids| tok.decode(ids), t, &res))
                         } else { None };
                         if full_text.len() > prev_text_len {
-                            let safe_offset = full_text.char_indices()
-                                .rev()
-                                .find(|&(i, _)| i <= prev_text_len)
-                                .map(|(i, _)| i)
-                                .unwrap_or(0);
-                            let delta = &full_text[safe_offset..];
+                            let delta = &full_text[prev_text_len..];
                             let ok = on_token(delta, tlp.as_ref());
                             if let Some(t) = tlp { all_lp.push(t); }
                             if !ok { break; }
