@@ -142,6 +142,7 @@ struct GenReq {
     /// (prompt/completion/total token counts) — clients like Open WebUI
     /// use this to compute decode tok/s for the display. No-op for
     /// non-streaming responses (usage is always in the body there).
+    #[allow(dead_code)]
     stream_include_usage: bool,
     /// OpenAI `logprobs`. `0` ⇒ omit logprobs entirely (the common case;
     /// no extra cost). `1..=N` ⇒ report the chosen token's logprob plus
@@ -501,9 +502,9 @@ fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-  fn completion_response(model: &str, text: &str, n_prompt: usize,
-                        n_completion: usize, hit_eos: bool,
-                        logprobs: &[TokenLogprob], prefill_ms: f64, decode_ms: f64) -> String {
+ fn completion_response(model: &str, text: &str, n_prompt: usize,
+                         n_completion: usize, hit_eos: bool,
+                         logprobs: &[TokenLogprob], prefill_ms: f64, decode_ms: f64, cached: usize) -> String {
     let id = format!("cmpl-{}", REQ_COUNTER.fetch_add(1, Ordering::Relaxed));
     let choice = Json::Obj(vec![
         ("text".into(),          Json::Str(text.to_string())),
@@ -512,7 +513,8 @@ fn unix_now() -> u64 {
         ("finish_reason".into(), Json::Str(
             if hit_eos { "stop" } else { "length" }.to_string())),
     ]);
-      let prompt_tok_s = if n_prompt > 0 && prefill_ms > 0.0 {
+      let new_prompt = n_prompt.saturating_sub(cached);
+        let prompt_tok_s = if n_prompt > 0 && prefill_ms > 0.0 {
             n_prompt as f64 * 1000.0 / prefill_ms
         } else { 0.0 };
         let tok_per_s = if n_completion > 0 && decode_ms > 0.0 {
@@ -528,12 +530,15 @@ fn unix_now() -> u64 {
             ("prompt_tokens".into(),     Json::Num(n_prompt as f64)),
             ("completion_tokens".into(), Json::Num(n_completion as f64)),
             ("total_tokens".into(),      Json::Num((n_prompt + n_completion) as f64)),
+            ("prompt_tokens_details".into(), Json::Obj(vec![
+                ("cached_tokens".into(), Json::Num(cached as f64)),
+            ])),
         ])),
         ("timings".into(),  Json::Obj(vec![
-            ("prompt_n".into(),                Json::Num(n_prompt as f64)),
+            ("prompt_n".into(),                Json::Num(new_prompt as f64)),
             ("prompt_ms".into(),               Json::Num(prefill_ms)),
             ("prompt_per_token_ms".into(),     Json::Num(
-                if n_prompt > 0 { prefill_ms / n_prompt as f64 } else { 0.0 })),
+                if new_prompt > 0 { prefill_ms / new_prompt as f64 } else { 0.0 })),
             ("prompt_per_second".into(),       Json::Num(prompt_tok_s)),
             ("predicted_n".into(),             Json::Num(n_completion as f64)),
             ("predicted_ms".into(),            Json::Num(decode_ms)),
@@ -645,9 +650,9 @@ impl ThinkingStripStream {
 
 /// raw-completion shape, but the choice carries a `message` object
 /// instead of a flat `text` field — what every chat SDK expects.
-  fn chat_completion_response(model: &str, text: &str, n_prompt: usize,
-                             n_completion: usize, hit_eos: bool,
-                             logprobs: &[TokenLogprob], prefill_ms: f64, decode_ms: f64) -> String {
+ fn chat_completion_response(model: &str, text: &str, n_prompt: usize,
+                              n_completion: usize, hit_eos: bool,
+                              logprobs: &[TokenLogprob], prefill_ms: f64, decode_ms: f64, cached: usize) -> String {
     let text = strip_thinking_channels(text);
     let id = format!("chatcmpl-{}", REQ_COUNTER.fetch_add(1, Ordering::Relaxed));
     let message = Json::Obj(vec![
@@ -661,6 +666,7 @@ impl ThinkingStripStream {
         ("finish_reason".into(), Json::Str(
             if hit_eos { "stop" } else { "length" }.to_string())),
     ]);
+    let new_prompt = n_prompt.saturating_sub(cached);
     let prompt_tok_s = if n_prompt > 0 && prefill_ms > 0.0 {
         n_prompt as f64 * 1000.0 / prefill_ms
     } else { 0.0 };
@@ -677,12 +683,15 @@ impl ThinkingStripStream {
             ("prompt_tokens".into(),     Json::Num(n_prompt as f64)),
             ("completion_tokens".into(), Json::Num(n_completion as f64)),
             ("total_tokens".into(),      Json::Num((n_prompt + n_completion) as f64)),
+            ("prompt_tokens_details".into(), Json::Obj(vec![
+                ("cached_tokens".into(), Json::Num(cached as f64)),
+            ])),
         ])),
         ("timings".into(),  Json::Obj(vec![
-            ("prompt_n".into(),                Json::Num(n_prompt as f64)),
+            ("prompt_n".into(),                Json::Num(new_prompt as f64)),
             ("prompt_ms".into(),               Json::Num(prefill_ms)),
             ("prompt_per_token_ms".into(),     Json::Num(
-                if n_prompt > 0 { prefill_ms / n_prompt as f64 } else { 0.0 })),
+                if new_prompt > 0 { prefill_ms / new_prompt as f64 } else { 0.0 })),
             ("prompt_per_second".into(),       Json::Num(prompt_tok_s)),
             ("predicted_n".into(),             Json::Num(n_completion as f64)),
             ("predicted_ms".into(),            Json::Num(decode_ms)),
@@ -1353,16 +1362,19 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                             metrics.decode_us_total.fetch_add(wall_us, Ordering::Relaxed);
                             if eos { metrics.requests_eos.fetch_add(1, Ordering::Relaxed); }
                             else   { metrics.requests_length.fetch_add(1, Ordering::Relaxed); }
-                            let decode_ms_log = (wall_us as f64 / 1000.0) - prefill_ms;
+                          let decode_ms_log = (wall_us as f64 / 1000.0) - prefill_ms;
+                            let prompt_tok_s = if n_p > 0 && prefill_ms > 0.0 {
+                                n_p as f64 * 1000.0 / prefill_ms
+                            } else { 0.0 };
                             let decode_tok_s = if n_c > 0 && decode_ms_log > 0.0 {
                                 n_c as f64 * 1000.0 / decode_ms_log
                             } else { 0.0 };
                             info!("req={} target={} type={} status=200 \
-                                   n_p={} n_c={} cached={} prefill_ms={:.1} decode_ms={:.1} decode_tok_s={:.1} finish={} stream={}",
-                           job.request_id, job.target.label(),
-                                 if is_chat { "chat" } else { "completion" },
-                                 n_p, n_c, cached_tok, prefill_ms, decode_ms_log, decode_tok_s,
-                                 if eos { "stop" } else { "length" }, is_stream);
+                                   n_p={} n_c={} cached={} prompt_tok_s={:.1} decode_tok_s={:.1} finish={} stream={}",
+                            job.request_id, job.target.label(),
+                                  if is_chat { "chat" } else { "completion" },
+                                  n_p, n_c, cached_tok, prompt_tok_s, decode_tok_s,
+                                  if eos { "stop" } else { "length" }, is_stream);
                             if is_stream {
                                 // Flush any text still buffered by the
                                 // thinking-marker stripper (e.g. model
@@ -1379,91 +1391,64 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                     };
                                     let _ = reply_tx.send(StreamMsg::Chunk(frame));
                                 }
-                                // Final SSE frame: empty delta + finish_reason.
+                                // Final SSE frame: empty delta + finish_reason + usage.
+                                // Sent as a single frame per OpenAI spec.
+                                // `prompt_tokens_details` carries cached token count.
+                                // `timings` block is a llama.cpp extension for OWUI / Llama Swap.
+                                let decode_ms = (wall_us as f64 / 1000.0) - prefill_ms;
+                                let prompt_tok_s = if n_p > 0 && prefill_ms > 0.0 {
+                                    n_p as f64 * 1000.0 / prefill_ms
+                                } else { 0.0 };
+                                let tok_per_s_f = if n_c > 0 && decode_ms > 0.0 {
+                                    n_c as f64 * 1000.0 / decode_ms
+                                } else { 0.0 };
                                 let fin = if eos { "stop" } else { "length" };
-                                let frame = if is_chat {
-                                    chat_stream_chunk(&stream_id, &model_name,
-                                        ChatDelta { role: None, content: None }, Some(fin), None)
-                                } else {
-                                    completion_stream_chunk(&stream_id, &model_name,
-                                        "", Some(fin), None)
-                                };
-                                let _ = reply_tx.send(StreamMsg::Chunk(frame));
-                                // Optional usage chunk per OpenAI spec
-                                // when stream_options.include_usage=true.
-                                // Clients like Open WebUI use this to
-                                // compute decode tok/s.
-                                if req.stream_include_usage {
-                                    // Three shapes coexist for max client
-                                    // compatibility:
-                                    //   * OpenAI usage (prompt_tokens / completion_tokens / total_tokens)
-                                    //   * Ollama-style fields inside usage (eval_count / eval_duration ns)
-                                    //   * llama.cpp-style `timings` at the
-                                    //     top level (predicted_per_second
-                                    //     pre-computed) — OWUI specifically
-                                    //     merges this into the usage object
-                                    //     in its stream handler.
-                                    let wall_ns = (wall_us as u64).saturating_mul(1_000);
-                                    let wall_ms = wall_us as f64 / 1000.0;
-                                    let decode_ms = wall_ms - prefill_ms;
-                                    let prompt_tok_s = if n_p > 0 && prefill_ms > 0.0 {
-                                        n_p as f64 * 1000.0 / prefill_ms
-                                    } else { 0.0 };
-                                    let tok_per_s_f = if n_c > 0 && decode_ms > 0.0 {
-                                        n_c as f64 * 1000.0 / decode_ms
-                                    } else { 0.0 };
-                                    let eval_ns = (decode_ms * 1_000_000.0) as u64;
-                                    let usage = Json::Obj(vec![
-                                        ("id".into(),      Json::Str(stream_id.clone())),
-                                        ("object".into(),  Json::Str(
-                                            if is_chat { "chat.completion.chunk" }
-                                            else       { "text_completion" }.into())),
-                                        ("created".into(), Json::Num(unix_now() as f64)),
-                                        ("model".into(),   Json::Str(model_name.clone())),
-                                        ("choices".into(), Json::Arr(vec![])),
-                                        ("usage".into(),   Json::Obj(vec![
-                                            // OpenAI-spec
-                                            ("prompt_tokens".into(),     Json::Num(n_p as f64)),
-                                            ("completion_tokens".into(), Json::Num(n_c as f64)),
-                                            ("total_tokens".into(),      Json::Num((n_p + n_c) as f64)),
-                                            // Ollama-compat
-                                            ("prompt_eval_count".into(),    Json::Num(n_p as f64)),
-                                            ("prompt_eval_duration".into(), Json::Num(prefill_ms * 1_000_000.0)),
-                                            ("eval_count".into(),           Json::Num(n_c as f64)),
-                                            ("eval_duration".into(),        Json::Num(eval_ns as f64)),
-                                            ("total_duration".into(),       Json::Num(wall_ns as f64)),
-                                        ])),
-                                        // llama.cpp `timings` — top-level
-                                        // sibling of `usage`. OWUI's
-                                        // middleware does:
-                                        //   raw_usage.update(data.get('timings', {}))
-                                        // so the per-second fields end up
-                                        // in the message's usage object and
-                                        // drive the tok/s display.
-                                        ("timings".into(),  Json::Obj(vec![
-                                            ("prompt_n".into(),                Json::Num(n_p as f64)),
-                                            ("prompt_ms".into(),               Json::Num(prefill_ms)),
-                                            ("prompt_per_token_ms".into(),     Json::Num(
-                                                if n_p > 0 { prefill_ms / n_p as f64 } else { 0.0 })),
-                                            ("prompt_per_second".into(),       Json::Num(prompt_tok_s)),
-                                            ("predicted_n".into(),             Json::Num(n_c as f64)),
-                                            ("predicted_ms".into(),            Json::Num(decode_ms)),
-                                            ("predicted_per_token_ms".into(),  Json::Num(
-                                                if n_c > 0 { decode_ms / n_c as f64 } else { 0.0 })),
-                                            ("predicted_per_second".into(),    Json::Num(tok_per_s_f)),
-                                        ])),
-                                    ]).to_string();
-                                    let _ = reply_tx.send(StreamMsg::Chunk(usage));
-                                }
+                                let mut choice_fields = vec![
+                                    ("index".into(), Json::Num(0.0)),
+                                    ("delta".into(), Json::Obj(vec![])),
+                                ];
+                                choice_fields.push(("finish_reason".into(), Json::Str(fin.to_string())));
+                                let mut usage_fields = vec![
+                                    ("prompt_tokens".into(),     Json::Num(n_p as f64)),
+                                    ("completion_tokens".into(), Json::Num(n_c as f64)),
+                                    ("total_tokens".into(),      Json::Num((n_p + n_c) as f64)),
+                                ];
+                                usage_fields.push(("prompt_tokens_details".into(), Json::Obj(vec![
+                                    ("cached_tokens".into(), Json::Num(cached_tok as f64)),
+                                ])));
+                                let timings_fields = vec![
+                                    ("prompt_n".into(),                Json::Num(n_p as f64)),
+                                    ("prompt_ms".into(),               Json::Num(prefill_ms)),
+                                    ("prompt_per_token_ms".into(),     Json::Num(
+                                        if n_p > 0 { prefill_ms / n_p as f64 } else { 0.0 })),
+                                    ("prompt_per_second".into(),       Json::Num(prompt_tok_s)),
+                                    ("predicted_n".into(),             Json::Num(n_c as f64)),
+                                    ("predicted_ms".into(),            Json::Num(decode_ms)),
+                                    ("predicted_per_token_ms".into(),  Json::Num(
+                                        if n_c > 0 { decode_ms / n_c as f64 } else { 0.0 })),
+                                    ("predicted_per_second".into(),    Json::Num(tok_per_s_f)),
+                                ];
+                                let usage_frame = Json::Obj(vec![
+                                    ("id".into(),      Json::Str(stream_id.clone())),
+                                    ("object".into(),  Json::Str(
+                                        if is_chat { "chat.completion.chunk" }
+                                        else       { "text_completion" }.into())),
+                                    ("created".into(), Json::Num(unix_now() as f64)),
+                                    ("model".into(),   Json::Str(model_name.clone())),
+                                    ("choices".into(), Json::Arr(vec![Json::Obj(choice_fields)])),
+                                    ("usage".into(),   Json::Obj(usage_fields)),
+                                    ("timings".into(), Json::Obj(timings_fields)),
+                                ]).to_string();
+                                let _ = reply_tx.send(StreamMsg::Chunk(usage_frame));
                                 // Done signals the connection handler to
                                 // write "data: [DONE]\n\n" and close.
                                 HttpReply { status: 200, status_text: "OK",
                                             body: String::new() }
                             } else {
                                 let body = if is_chat {
-                                    chat_completion_response(&model_name, &text, n_p, n_c, eos, &lp, prefill_ms, decode_ms_log)
+                                    chat_completion_response(&model_name, &text, n_p, n_c, eos, &lp, prefill_ms, decode_ms_log, cached_tok)
                                 } else {
-                                    completion_response(&model_name, &text, n_p, n_c, eos, &lp, prefill_ms, decode_ms_log)
+                                    completion_response(&model_name, &text, n_p, n_c, eos, &lp, prefill_ms, decode_ms_log, cached_tok)
                                 };
                                 HttpReply { status: 200, status_text: "OK", body }
                             }
