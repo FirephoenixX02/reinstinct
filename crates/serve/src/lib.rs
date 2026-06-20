@@ -245,13 +245,13 @@ const CHAT_DEFAULTS: SamplerDefaults = SamplerDefaults {
     repetition_penalty: 1.1, frequency_penalty: 0.1,
 };
 
-fn parse_common_fields(j: &Json, defaults: SamplerDefaults)
+fn parse_common_fields(j: &Json, defaults: SamplerDefaults, default_max_tokens: usize)
     -> (usize, reinstinct_sampling::SamplerParams, Option<bool>, Option<usize>, f32,
         Option<std::time::Duration>, bool, bool, usize)
 {
     use reinstinct_sampling::{SamplerParams, MirostatV2};
     let max_tokens = j.get("max_tokens").and_then(Json::as_f64)
-        .map(|n| n as usize).unwrap_or(256).clamp(1, 4096);
+        .map(|n| n as usize).unwrap_or(default_max_tokens).max(1);
 
     let mut sp = SamplerParams::default();
     sp.temperature = j.get("temperature").and_then(Json::as_f64)
@@ -440,7 +440,7 @@ fn render_text_logprobs(lp: &[TokenLogprob]) -> Json {
 
 /// Parse an OpenAI `/v1/completions` body into a `GenReq`. Raw-prompt
 /// path; no chat template is applied server-side.
-fn parse_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> {
+fn parse_completions(body: &str, default_max_tokens: usize) -> Result<GenReq, (u16, &'static str, String)> {
     let bad = |m: String| (400u16, "Bad Request", m);
     let j = Json::parse(body).map_err(|e| bad(format!("invalid JSON: {e}")))?;
     let prompt = j.get("prompt").and_then(Json::as_str)
@@ -448,7 +448,7 @@ fn parse_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> 
         .to_string();
     let (max_tokens, sampler, use_speculative, speculative_k, speculative_p_min,
          request_timeout, stream, stream_include_usage, top_logprobs_n) =
-        parse_common_fields(&j, COMPLETION_DEFAULTS);
+        parse_common_fields(&j, COMPLETION_DEFAULTS, default_max_tokens);
     Ok(GenReq { prompt: PromptInput::Raw(prompt), max_tokens, sampler,
                 use_speculative, speculative_k, speculative_p_min,
                 request_timeout, stream, stream_include_usage, top_logprobs_n })
@@ -457,7 +457,7 @@ fn parse_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> 
 /// Parse an OpenAI `/v1/chat/completions` body into a `GenReq`. The
 /// `messages` array becomes a `PromptInput::Chat`; the worker's
 /// model knows which per-architecture chat template to apply.
-fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> {
+fn parse_chat_completions(body: &str, default_max_tokens: usize) -> Result<GenReq, (u16, &'static str, String)> {
     use reinstinct_chat::{ChatMessage, Role};
     let bad = |m: String| (400u16, "Bad Request", m);
     let j = Json::parse(body).map_err(|e| bad(format!("invalid JSON: {e}")))?;
@@ -487,7 +487,7 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
     }
     let (max_tokens, sampler, use_speculative, speculative_k, speculative_p_min,
          request_timeout, stream, stream_include_usage, top_logprobs_n) =
-        parse_common_fields(&j, CHAT_DEFAULTS);
+        parse_common_fields(&j, CHAT_DEFAULTS, default_max_tokens);
     Ok(GenReq { prompt: PromptInput::Chat(messages), max_tokens, sampler,
                 use_speculative, speculative_k, speculative_p_min,
                 request_timeout, stream, stream_include_usage, top_logprobs_n })
@@ -922,11 +922,13 @@ impl ServerModel {
                 if prompt.is_empty() {
                     return Err("prompt encoded to zero tokens".into());
                 }
-                if prompt.len() + req.max_tokens + 4 > *max_seq {
-                    return Err(format!(
-                        "prompt ({}) + max_tokens ({}) exceeds context window ({})",
-                        prompt.len(), req.max_tokens, *max_seq));
-                }
+                // Clamp max_tokens to remaining context window (safety margin 4).
+                let remaining = (*max_seq).saturating_sub(prompt.len()).saturating_sub(4);
+                let effective_max_tokens = if req.max_tokens > remaining {
+                    warn!("max_tokens={} clamped to {} (prompt={}, context={})",
+                         req.max_tokens, remaining, prompt.len(), *max_seq);
+                    remaining
+                } else { req.max_tokens };
                 state.reset()?;
                 let mut logits = if prompt.len() > 1 {
                     gpu.forward_tokens_batched(&prompt, state)?
@@ -940,8 +942,8 @@ impl ServerModel {
                 let mut hit_eos = false;
                 let mut prev_text_len: usize = 0;
                 let mut full_text = String::new();
-                let mut all_lp: Vec<TokenLogprob> = Vec::new();
-                for _ in 0..req.max_tokens {
+              let mut all_lp: Vec<TokenLogprob> = Vec::new();
+                 for _ in 0..effective_max_tokens {
                     if let Some(d) = deadline {
                         if std::time::Instant::now() >= d { break; }
                     }
@@ -996,11 +998,13 @@ impl ServerModel {
                 if prompt.is_empty() {
                     return Err("prompt encoded to zero tokens".into());
                 }
-                if prompt.len() + req.max_tokens + 8 > *max_seq {
-                    return Err(format!(
-                        "prompt ({}) + max_tokens ({}) exceeds context window ({})",
-                        prompt.len(), req.max_tokens, *max_seq));
-                }
+                // Clamp max_tokens to remaining context window (safety margin 8).
+                let remaining_g = (*max_seq).saturating_sub(prompt.len()).saturating_sub(8);
+                let effective_max_tokens_g = if req.max_tokens > remaining_g {
+                    warn!("max_tokens={} clamped to {} (prompt={}, context={})",
+                         req.max_tokens, remaining_g, prompt.len(), *max_seq);
+                    remaining_g
+                } else { req.max_tokens };
                 // Dispatch: spec-decode when a drafter is loaded AND the
                 // request hasn't opted out. Default-on if drafter present.
                 let want_spec = match req.use_speculative {
@@ -1066,7 +1070,7 @@ impl ServerModel {
                     let mut prev_text_len: usize = 0;
                     let mut full_text = String::new();
                     let mut all_lp: Vec<TokenLogprob> = Vec::new();
-                    for _ in 0..req.max_tokens {
+                    for _ in 0..effective_max_tokens_g {
                         if let Some(d) = deadline {
                             if std::time::Instant::now() >= d { break; }
                         }
@@ -1124,7 +1128,7 @@ impl ServerModel {
                     verify_logits,
                     *prompt.last().unwrap(),
                     *eos,
-                    req.max_tokens, k, req.sampler.temperature, req.sampler.seed,
+                    effective_max_tokens_g, k, req.sampler.temperature, req.sampler.seed,
                     req.speculative_p_min,
                     adaptive_alpha, adaptive_window,
                 )?;
@@ -1450,8 +1454,8 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
 // --- connection handling ----------------------------------------------
 
 fn handle_conn(mut stream: std::net::TcpStream, target: Target,
-               tx: mpsc::Sender<Job>, metrics: Arc<Metrics>,
-               model_name: Arc<String>)
+                tx: mpsc::Sender<Job>, metrics: Arc<Metrics>,
+                model_name: Arc<String>, default_max_tokens: usize)
 {
     let request_id = metrics.requests_total.fetch_add(1, Ordering::Relaxed) + 1;
     let request = match http::read_request(&stream) {
@@ -1547,8 +1551,8 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
                 top_logprobs_n: 0,
             })
         }
-        Some("chat") => parse_chat_completions(&request.body),
-        Some("completions") => parse_completions(&request.body),
+        Some("chat") => parse_chat_completions(&request.body, default_max_tokens),
+        Some("completions") => parse_completions(&request.body, default_max_tokens),
         Some(other) => unreachable!("unknown route tag {other}"),
     };
 
@@ -1611,7 +1615,7 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
 }
 
 fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
-            metrics: Arc<Metrics>, model_name: Arc<String>) {
+             metrics: Arc<Metrics>, model_name: Arc<String>, default_max_tokens: usize) {
     let listener = match std::net::TcpListener::bind(("0.0.0.0", port)) {
         Ok(l) => l,
         Err(e) => { error!("FATAL: cannot bind port {port}: {e}"); return; }
@@ -1623,7 +1627,7 @@ fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
                 let tx = tx.clone();
                 let metrics = Arc::clone(&metrics);
                 let model_name = Arc::clone(&model_name);
-                thread::spawn(move || handle_conn(stream, target, tx, metrics, model_name));
+                thread::spawn(move || handle_conn(stream, target, tx, metrics, model_name, default_max_tokens));
             }
             Err(e) => warn!("accept error on :{port}: {e}"),
         }
@@ -1631,9 +1635,10 @@ fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
 }
 
 /// Start the three-port multi-model server. Blocks forever.
-  pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
-           small: Option<PathBuf>, embed: Option<PathBuf>,
-           big_port: u16, small_port: u16, embed_port: u16, max_seq: usize)
+ pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
+            small: Option<PathBuf>, embed: Option<PathBuf>,
+            big_port: u16, small_port: u16, embed_port: u16,
+            max_seq: usize, default_max_tokens: usize)
     -> Result<(), String>
 {
     // Surface any REINSTINCT_* env vars at startup. Several of them are
@@ -1712,8 +1717,9 @@ fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
     for (port, target, name) in acceptors {
         let tx = tx.clone();
         let metrics = Arc::clone(&metrics);
+        let max_tok = default_max_tokens;
         thread::Builder::new().name(format!("accept-{}", target.label()))
-            .spawn(move || acceptor(port, target, tx, metrics, name))
+            .spawn(move || acceptor(port, target, tx, metrics, name, max_tok))
             .map_err(|e| e.to_string())?;
     }
     drop(tx);   // only the acceptors hold senders now
@@ -1730,7 +1736,7 @@ mod logprobs_tests {
         // tuple positions 0..8: max_tokens, sampler, use_speculative,
         // speculative_k, speculative_p_min, request_timeout, stream,
         // stream_include_usage, top_logprobs_n  (← .8)
-        parse_common_fields(&Json::parse(body).unwrap(), COMPLETION_DEFAULTS).8
+         parse_common_fields(&Json::parse(body).unwrap(), COMPLETION_DEFAULTS, 256).8
     }
 
     #[test]
