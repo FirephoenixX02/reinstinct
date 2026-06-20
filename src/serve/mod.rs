@@ -1489,8 +1489,8 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
         let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
         return;
     }
-    // Plain GET /healthz — tiny liveness check.
-    if is_get && path.ends_with("/healthz") {
+    // Plain GET /health — tiny liveness check.
+    if is_get && path.ends_with("/health") {
         let body = "ok\n";
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
@@ -1539,7 +1539,7 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
     let req = match route {
         None => Err((404u16, "Not Found",
             format!("no route for {} {} (expected POST /v1/completions or \
-                     /v1/chat/completions on this port, or GET /metrics / /healthz)",
+                     /v1/chat/completions on this port, or GET /metrics / /health)",
                     request.method, request.path))),
         Some("embed") => {
             // Worker answers 503; keep the shape.
