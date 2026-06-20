@@ -501,9 +501,9 @@ fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn completion_response(model: &str, text: &str, n_prompt: usize,
-                       n_completion: usize, hit_eos: bool,
-                       logprobs: &[TokenLogprob]) -> String {
+  fn completion_response(model: &str, text: &str, n_prompt: usize,
+                        n_completion: usize, hit_eos: bool,
+                        logprobs: &[TokenLogprob], prefill_ms: f64, decode_ms: f64) -> String {
     let id = format!("cmpl-{}", REQ_COUNTER.fetch_add(1, Ordering::Relaxed));
     let choice = Json::Obj(vec![
         ("text".into(),          Json::Str(text.to_string())),
@@ -512,7 +512,13 @@ fn completion_response(model: &str, text: &str, n_prompt: usize,
         ("finish_reason".into(), Json::Str(
             if hit_eos { "stop" } else { "length" }.to_string())),
     ]);
-    Json::Obj(vec![
+      let prompt_tok_s = if n_prompt > 0 && prefill_ms > 0.0 {
+            n_prompt as f64 * 1000.0 / prefill_ms
+        } else { 0.0 };
+        let tok_per_s = if n_completion > 0 && decode_ms > 0.0 {
+            n_completion as f64 * 1000.0 / decode_ms
+        } else { 0.0 };
+        Json::Obj(vec![
         ("id".into(),      Json::Str(id)),
         ("object".into(),  Json::Str("text_completion".into())),
         ("created".into(), Json::Num(unix_now() as f64)),
@@ -522,6 +528,18 @@ fn completion_response(model: &str, text: &str, n_prompt: usize,
             ("prompt_tokens".into(),     Json::Num(n_prompt as f64)),
             ("completion_tokens".into(), Json::Num(n_completion as f64)),
             ("total_tokens".into(),      Json::Num((n_prompt + n_completion) as f64)),
+        ])),
+        ("timings".into(),  Json::Obj(vec![
+            ("prompt_n".into(),                Json::Num(n_prompt as f64)),
+            ("prompt_ms".into(),               Json::Num(prefill_ms)),
+            ("prompt_per_token_ms".into(),     Json::Num(
+                if n_prompt > 0 { prefill_ms / n_prompt as f64 } else { 0.0 })),
+            ("prompt_per_second".into(),       Json::Num(prompt_tok_s)),
+            ("predicted_n".into(),             Json::Num(n_completion as f64)),
+            ("predicted_ms".into(),            Json::Num(decode_ms)),
+            ("predicted_per_token_ms".into(),  Json::Num(
+                if n_completion > 0 { decode_ms / n_completion as f64 } else { 0.0 })),
+            ("predicted_per_second".into(),    Json::Num(tok_per_s)),
         ])),
     ]).to_string()
 }
@@ -627,9 +645,9 @@ impl ThinkingStripStream {
 
 /// raw-completion shape, but the choice carries a `message` object
 /// instead of a flat `text` field — what every chat SDK expects.
-fn chat_completion_response(model: &str, text: &str, n_prompt: usize,
-                            n_completion: usize, hit_eos: bool,
-                            logprobs: &[TokenLogprob]) -> String {
+  fn chat_completion_response(model: &str, text: &str, n_prompt: usize,
+                             n_completion: usize, hit_eos: bool,
+                             logprobs: &[TokenLogprob], prefill_ms: f64, decode_ms: f64) -> String {
     let text = strip_thinking_channels(text);
     let id = format!("chatcmpl-{}", REQ_COUNTER.fetch_add(1, Ordering::Relaxed));
     let message = Json::Obj(vec![
@@ -643,6 +661,12 @@ fn chat_completion_response(model: &str, text: &str, n_prompt: usize,
         ("finish_reason".into(), Json::Str(
             if hit_eos { "stop" } else { "length" }.to_string())),
     ]);
+    let prompt_tok_s = if n_prompt > 0 && prefill_ms > 0.0 {
+        n_prompt as f64 * 1000.0 / prefill_ms
+    } else { 0.0 };
+    let tok_per_s = if n_completion > 0 && decode_ms > 0.0 {
+        n_completion as f64 * 1000.0 / decode_ms
+    } else { 0.0 };
     Json::Obj(vec![
         ("id".into(),      Json::Str(id)),
         ("object".into(),  Json::Str("chat.completion".into())),
@@ -653,6 +677,18 @@ fn chat_completion_response(model: &str, text: &str, n_prompt: usize,
             ("prompt_tokens".into(),     Json::Num(n_prompt as f64)),
             ("completion_tokens".into(), Json::Num(n_completion as f64)),
             ("total_tokens".into(),      Json::Num((n_prompt + n_completion) as f64)),
+        ])),
+        ("timings".into(),  Json::Obj(vec![
+            ("prompt_n".into(),                Json::Num(n_prompt as f64)),
+            ("prompt_ms".into(),               Json::Num(prefill_ms)),
+            ("prompt_per_token_ms".into(),     Json::Num(
+                if n_prompt > 0 { prefill_ms / n_prompt as f64 } else { 0.0 })),
+            ("prompt_per_second".into(),       Json::Num(prompt_tok_s)),
+            ("predicted_n".into(),             Json::Num(n_completion as f64)),
+            ("predicted_ms".into(),            Json::Num(decode_ms)),
+            ("predicted_per_token_ms".into(),  Json::Num(
+                if n_completion > 0 { decode_ms / n_completion as f64 } else { 0.0 })),
+            ("predicted_per_second".into(),    Json::Num(tok_per_s)),
         ])),
     ]).to_string()
 }
@@ -895,7 +931,7 @@ impl ServerModel {
     /// decode path (which doesn't surface per-token softmax probs today).
     fn generate(&mut self, req: &GenReq,
                 mut on_token: impl FnMut(&str, Option<&TokenLogprob>) -> bool)
-        -> Result<(String, usize, usize, bool, Vec<TokenLogprob>), String>
+        -> Result<(String, usize, usize, bool, Vec<TokenLogprob>, f64, usize), String>
     {
         use reinstinct_sampling::{Rng, sample_chain_lp};
         let mut sp = req.sampler.clone();
@@ -930,11 +966,13 @@ impl ServerModel {
                     remaining
                 } else { req.max_tokens };
                 state.reset()?;
+                let t_pre = std::time::Instant::now();
                 let mut logits = if prompt.len() > 1 {
                     gpu.forward_tokens_batched(&prompt, state)?
                 } else {
                     gpu.forward_tokens(&prompt, state)?
                 };
+                let prefill_ms = t_pre.elapsed().as_secs_f64() * 1e3;
                 let vocab = logits.len();
                 let mut counts: Vec<u16> = if sp.frequency_penalty != 0.0
                     || sp.presence_penalty != 0.0 { vec![0u16; vocab] } else { Vec::new() };
@@ -977,7 +1015,7 @@ impl ServerModel {
                     }
                     logits = gpu.forward_token(t, state)?;
                 }
-                Ok((full_text, prompt.len(), out.len(), hit_eos, all_lp))
+                Ok((full_text, prompt.len(), out.len(), hit_eos, all_lp, prefill_ms, 0))
             }
             ServerModel::Gemma { gpu, state, tok, eos, bos, max_seq, drafter, prefix_cache, .. } => {
                 let prompt = match &req.prompt {
@@ -1042,6 +1080,7 @@ impl ServerModel {
                 if !do_spec {
                     // Plain prefill + decode. If we hit the prefix cache,
                     // prefill only the suffix; otherwise full prompt.
+                    let t_pre = std::time::Instant::now();
                     let mut logits = if restored {
                         let suffix = &prompt[overlap..];
                         info!("req kv-cache hit: \
@@ -1051,6 +1090,7 @@ impl ServerModel {
                     } else {
                         gpu.prefill_forward(&prompt, state)?
                     };
+                    let prefill_ms = t_pre.elapsed().as_secs_f64() * 1e3;
                     // Snapshot the post-prompt state for future requests
                     // that share a prefix. Best-effort — a snapshot
                     // allocation failure shouldn't abort the request,
@@ -1096,7 +1136,7 @@ impl ServerModel {
                         }
                         logits = gpu.forward_token(t, state)?;
                     }
-                    return Ok((full_text, prompt.len(), out.len(), hit_eos, all_lp));
+                    return Ok((full_text, prompt.len(), out.len(), hit_eos, all_lp, prefill_ms, overlap));
                 }
 
                 // Spec-decode path: prefill, then K=req.speculative_k
@@ -1107,8 +1147,10 @@ impl ServerModel {
                 // Prefill all but the last token — its logits aren't
                 // useful; the verify path immediately re-forwards it
                 // through `forward_token` to seed the chain.
+                let t_pre = std::time::Instant::now();
                 let _ = gpu.prefill_forward(&prompt[..prompt.len() - 1], state)?;
                 let verify_logits = gpu.forward_token(*prompt.last().unwrap(), state)?;
+                let prefill_ms = t_pre.elapsed().as_secs_f64() * 1e3;
                 if d.verify_graphs[k].is_none() && !gpu.is_moe() {
                     d.verify_graphs[k] = Some(gpu.capture_verify_graph(state, k)?);
                 }
@@ -1142,7 +1184,7 @@ impl ServerModel {
                 // No per-token logprobs from spec-decode today; the response
                 // shaper renders `logprobs: null` when the vec is empty.
                 Ok((tok.decode(&gen_toks), prompt.len(), gen_toks.len(),
-                    stats.hit_eos, Vec::new()))
+                    stats.hit_eos, Vec::new(), prefill_ms, overlap))
             }
         }
     }
@@ -1299,7 +1341,7 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                     let result = std::panic::catch_unwind(
                         std::panic::AssertUnwindSafe(|| model.generate(&req, on_token)));
                     match result {
-                        Ok(Ok((text, n_p, n_c, eos, lp))) => {
+                        Ok(Ok((text, n_p, n_c, eos, lp, prefill_ms, cached_tok))) => {
                             let wall_us = t.elapsed().as_micros() as u64;
                             metrics.requests_ok.fetch_add(1, Ordering::Relaxed);
                             metrics.prompt_tokens.fetch_add(n_p as u64, Ordering::Relaxed);
@@ -1307,15 +1349,16 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                             metrics.decode_us_total.fetch_add(wall_us, Ordering::Relaxed);
                             if eos { metrics.requests_eos.fetch_add(1, Ordering::Relaxed); }
                             else   { metrics.requests_length.fetch_add(1, Ordering::Relaxed); }
-                            let tok_per_s = if n_c > 0 && wall_us > 0 {
-                                n_c as f64 * 1_000_000.0 / wall_us as f64
+                            let decode_ms_log = (wall_us as f64 / 1000.0) - prefill_ms;
+                            let decode_tok_s = if n_c > 0 && decode_ms_log > 0.0 {
+                                n_c as f64 * 1000.0 / decode_ms_log
                             } else { 0.0 };
                             info!("req={} target={} type={} status=200 \
-                                   n_p={} n_c={} wall_ms={:.1} tok_s={:.1} finish={} stream={}",
-                                job.request_id, job.target.label(),
-                                if is_chat { "chat" } else { "completion" },
-                                n_p, n_c, wall_us as f64 / 1000.0, tok_per_s,
-                                if eos { "stop" } else { "length" }, is_stream);
+                                   n_p={} n_c={} cached={} prefill_ms={:.1} decode_ms={:.1} decode_tok_s={:.1} finish={} stream={}",
+                           job.request_id, job.target.label(),
+                                 if is_chat { "chat" } else { "completion" },
+                                 n_p, n_c, cached_tok, prefill_ms, decode_ms_log, decode_tok_s,
+                                 if eos { "stop" } else { "length" }, is_stream);
                             if is_stream {
                                 // Flush any text still buffered by the
                                 // thinking-marker stripper (e.g. model
@@ -1358,9 +1401,14 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                     //     in its stream handler.
                                     let wall_ns = (wall_us as u64).saturating_mul(1_000);
                                     let wall_ms = wall_us as f64 / 1000.0;
-                                    let tok_per_s_f = if n_c > 0 && wall_us > 0 {
-                                        n_c as f64 * 1_000_000.0 / wall_us as f64
+                                    let decode_ms = wall_ms - prefill_ms;
+                                    let prompt_tok_s = if n_p > 0 && prefill_ms > 0.0 {
+                                        n_p as f64 * 1000.0 / prefill_ms
                                     } else { 0.0 };
+                                    let tok_per_s_f = if n_c > 0 && decode_ms > 0.0 {
+                                        n_c as f64 * 1000.0 / decode_ms
+                                    } else { 0.0 };
+                                    let eval_ns = (decode_ms * 1_000_000.0) as u64;
                                     let usage = Json::Obj(vec![
                                         ("id".into(),      Json::Str(stream_id.clone())),
                                         ("object".into(),  Json::Str(
@@ -1376,9 +1424,9 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                             ("total_tokens".into(),      Json::Num((n_p + n_c) as f64)),
                                             // Ollama-compat
                                             ("prompt_eval_count".into(),    Json::Num(n_p as f64)),
-                                            ("prompt_eval_duration".into(), Json::Num(0.0)),
+                                            ("prompt_eval_duration".into(), Json::Num(prefill_ms * 1_000_000.0)),
                                             ("eval_count".into(),           Json::Num(n_c as f64)),
-                                            ("eval_duration".into(),        Json::Num(wall_ns as f64)),
+                                            ("eval_duration".into(),        Json::Num(eval_ns as f64)),
                                             ("total_duration".into(),       Json::Num(wall_ns as f64)),
                                         ])),
                                         // llama.cpp `timings` — top-level
@@ -1390,13 +1438,14 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                         // drive the tok/s display.
                                         ("timings".into(),  Json::Obj(vec![
                                             ("prompt_n".into(),                Json::Num(n_p as f64)),
-                                            ("prompt_ms".into(),               Json::Num(0.0)),
-                                            ("prompt_per_token_ms".into(),     Json::Num(0.0)),
-                                            ("prompt_per_second".into(),       Json::Num(0.0)),
+                                            ("prompt_ms".into(),               Json::Num(prefill_ms)),
+                                            ("prompt_per_token_ms".into(),     Json::Num(
+                                                if n_p > 0 { prefill_ms / n_p as f64 } else { 0.0 })),
+                                            ("prompt_per_second".into(),       Json::Num(prompt_tok_s)),
                                             ("predicted_n".into(),             Json::Num(n_c as f64)),
-                                            ("predicted_ms".into(),            Json::Num(wall_ms)),
+                                            ("predicted_ms".into(),            Json::Num(decode_ms)),
                                             ("predicted_per_token_ms".into(),  Json::Num(
-                                                if n_c > 0 { wall_ms / n_c as f64 } else { 0.0 })),
+                                                if n_c > 0 { decode_ms / n_c as f64 } else { 0.0 })),
                                             ("predicted_per_second".into(),    Json::Num(tok_per_s_f)),
                                         ])),
                                     ]).to_string();
@@ -1408,9 +1457,9 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                             body: String::new() }
                             } else {
                                 let body = if is_chat {
-                                    chat_completion_response(&model_name, &text, n_p, n_c, eos, &lp)
+                                    chat_completion_response(&model_name, &text, n_p, n_c, eos, &lp, prefill_ms, decode_ms_log)
                                 } else {
-                                    completion_response(&model_name, &text, n_p, n_c, eos, &lp)
+                                    completion_response(&model_name, &text, n_p, n_c, eos, &lp, prefill_ms, decode_ms_log)
                                 };
                                 HttpReply { status: 200, status_text: "OK", body }
                             }
