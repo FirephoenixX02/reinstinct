@@ -960,7 +960,12 @@ impl ServerModel {
                         Some(decode_token_logprob(|ids| tok.decode(ids), t, &res))
                     } else { None };
                     if full_text.len() > prev_text_len {
-                        let delta = &full_text[prev_text_len..];
+                        let safe_offset = full_text.char_indices()
+                            .rev()
+                            .find(|&(i, _)| i <= prev_text_len)
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        let delta = &full_text[safe_offset..];
                         let ok = on_token(delta, tlp.as_ref());
                         if let Some(t) = tlp { all_lp.push(t); }
                         if !ok {
@@ -1081,7 +1086,12 @@ impl ServerModel {
                             Some(decode_token_logprob(|ids| tok.decode(ids), t, &res))
                         } else { None };
                         if full_text.len() > prev_text_len {
-                            let delta = &full_text[prev_text_len..];
+                            let safe_offset = full_text.char_indices()
+                                .rev()
+                                .find(|&(i, _)| i <= prev_text_len)
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            let delta = &full_text[safe_offset..];
                             let ok = on_token(delta, tlp.as_ref());
                             if let Some(t) = tlp { all_lp.push(t); }
                             if !ok { break; }
