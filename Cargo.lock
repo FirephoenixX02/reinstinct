@@ -366,22 +366,130 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "reinstinct-chat"
+version = "0.1.0"
+dependencies = [
+ "reinstinct-gguf",
+ "reinstinct-tokenizer",
+]
+
+[[package]]
+name = "reinstinct-cpu"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "rayon",
+ "reinstinct-gguf",
+ "reinstinct-model",
+ "reinstinct-quant",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "reinstinct-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bytemuck",
  "clap",
- "fancy-regex",
  "half",
- "libloading",
  "memmap2",
- "rayon",
+ "reinstinct-chat",
+ "reinstinct-cpu",
+ "reinstinct-gguf",
+ "reinstinct-hip",
+ "reinstinct-model",
+ "reinstinct-quant",
+ "reinstinct-runtime",
+ "reinstinct-sampling",
+ "reinstinct-serve",
+ "reinstinct-tokenizer",
  "serde_json",
- "thiserror",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "reinstinct-gguf"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "memmap2",
+ "thiserror",
+]
+
+[[package]]
+name = "reinstinct-hip"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
+name = "reinstinct-model"
+version = "0.1.0"
+dependencies = [
+ "reinstinct-gguf",
+ "thiserror",
+]
+
+[[package]]
+name = "reinstinct-quant"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "half",
+ "reinstinct-gguf",
+ "tracing",
+]
+
+[[package]]
+name = "reinstinct-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "half",
+ "rayon",
+ "reinstinct-cpu",
+ "reinstinct-gguf",
+ "reinstinct-hip",
+ "reinstinct-model",
+ "reinstinct-quant",
+ "reinstinct-sampling",
+ "tracing",
  "xxhash-rust",
+]
+
+[[package]]
+name = "reinstinct-sampling"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
+name = "reinstinct-serve"
+version = "0.1.0"
+dependencies = [
+ "reinstinct-chat",
+ "reinstinct-gguf",
+ "reinstinct-hip",
+ "reinstinct-model",
+ "reinstinct-runtime",
+ "reinstinct-sampling",
+ "reinstinct-tokenizer",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "reinstinct-tokenizer"
+version = "0.1.0"
+dependencies = [
+ "fancy-regex",
+ "reinstinct-gguf",
+ "tracing",
 ]
 
 [[package]]

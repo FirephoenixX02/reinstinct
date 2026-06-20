@@ -3,16 +3,16 @@
 ## What this is
 
 Custom HIP inference engine for AMD MI50/MI60 (gfx906), written in Rust.
-Single crate, single binary (`reinstinct-engine`). No build.rs — HIP kernels
-in `kernels/*.cpp` are embedded via `include_str!` in Rust source and
-compiled on first use with `hipcc`, then cached at `~/.cache/reinstinct/kernels/`.
+Cargo workspace with 10 library crates + 1 binary crate (`reinstinct-engine`).
+HIP kernels in `kernels/*.cpp` are embedded via `include_str!` in Rust source
+and compiled on first use with `hipcc`, then cached at `~/.cache/reinstinct/kernels/`.
 
 ## Commands
 
 ```
 cargo build --release          # production binary → ./target/release/reinstinct-engine
-cargo test                     # unit tests (CPU oracle only, no GPU needed)
-cargo test --release           # same, faster
+cargo test --workspace         # all tests (CPU oracle only, no GPU needed)
+cargo test --workspace --release  # same, faster
 scripts/bench-all.sh           # full decode + prefill + MTP benchmark (needs GPU + models)
 scripts/bench-all.sh quick     # decode-only benchmark
 ```
@@ -31,35 +31,39 @@ scripts/bench-all.sh quick     # decode-only benchmark
 Most tests require a GGUF model fixture. They skip gracefully when absent.
 
 ```
-cargo test                     # runs; most tests skip without fixture
-REINSTINCT_GGUF_FIXTURE=/path/to/model.gguf cargo test   # override fixture path
+cargo test --workspace                     # runs; most tests skip without fixture
+REINSTINCT_GGUF_FIXTURE=/path/to/model.gguf cargo test --workspace   # override fixture path
 ```
 
 Default fixture path: `~/models/qwen-3.5-0.8B/Qwen3.5-0.8B-UD-Q4_K_XL.gguf`.
 
-Golden tests (`tests/qwen35_golden.rs`) compare CPU forward against JSON fixtures
-in `tests/golden/`. The golden-logits helper (`tests/golden/dump_logits`) is built
-separately via `tests/golden/build.sh` against an external llama.cpp build.
+Golden tests (`engine/tests/qwen35_golden.rs`) compare CPU forward against JSON fixtures
+in `engine/tests/golden/`. The golden-logits helper (`engine/tests/golden/dump_logits`) is built
+separately via `engine/tests/golden/build.sh` against an external llama.cpp build.
 
 GPU oracle tests use `set_dp4a(false)` + quantization-realistic tolerances + top-K comparison.
 
 ## Key source layout
 
 ```
-src/main.rs          — CLI (clap), all subcommands
-src/lib.rs           — public module surface
-src/runtime/gemma4.rs     — Gemma 4 GPU forward (prefill + decode)
-src/runtime/qwen35.rs     — Qwen 3.5/3.6 GPU forward (hybrid GDN + attention)
-src/runtime/kernels.rs    — kernel compilation cache + test launchers
-src/runtime/spec_decode.rs — MTP speculative decoding
-src/runtime/kv_superquant.rs — tiered KV cache (int8 + turbo3)
-src/hip/             — runtime dlopen of libamdhip64.so, safe wrappers
-src/gguf/            — zero-copy GGUF parser (memmap2)
-src/cpu/             — CPU oracle (f32 reference, validation only)
-src/model/           — typed model structs (gemma4, qwen35)
-src/quant/           — quantization format structs (q4_k, q5_k, q6_k, q8_0, iq4_xs, turbo3)
-src/serve/           — OpenAI-compatible HTTP server
-kernels/             — 122 HIP kernel source files (.cpp)
+engine/src/main.rs          — CLI (clap), all subcommands
+engine/src/lib.rs           — re-exports all library crates
+engine/tests/               — integration tests
+crates/runtime/gemma4.rs    — Gemma 4 GPU forward (prefill + decode)
+crates/runtime/qwen35.rs    — Qwen 3.5/3.6 GPU forward (hybrid GDN + attention)
+crates/runtime/kernels.rs   — kernel compilation cache + test launchers
+crates/runtime/spec_decode.rs — MTP speculative decoding
+crates/runtime/kv_superquant.rs — tiered KV cache (int8 + turbo3)
+crates/hip/                 — runtime dlopen of libamdhip64.so, safe wrappers
+crates/gguf/                — zero-copy GGUF parser (memmap2)
+crates/cpu/                 — CPU oracle (f32 reference, validation only)
+crates/model/               — typed model structs (gemma4, qwen35)
+crates/quant/               — quantization format structs (q4_k, q5_k, q6_k, q8_0, iq4_xs, turbo3)
+crates/serve/               — OpenAI-compatible HTTP server
+crates/tokenizer/           — BPE tokenizer (GPT2 + Gemma SPM)
+crates/chat/                — chat template rendering
+crates/sampling/            — token samplers (argmax, top-k, mirostat)
+kernels/                    — 122 HIP kernel source files (.cpp)
 ```
 
 ## Architecture

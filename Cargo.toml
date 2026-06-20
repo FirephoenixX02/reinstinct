@@ -1,44 +1,38 @@
-[package]
-name = "reinstinct-engine"
-version = "0.1.0"
-edition = "2024"
-description = "Custom HIP inference engine for AMD MI50/MI60 (gfx906)"
-license = "Apache-2.0"
+[workspace]
+resolver = "3"
+members = [
+    "crates/hip",
+    "crates/gguf",
+    "crates/sampling",
+    "crates/quant",
+    "crates/model",
+    "crates/tokenizer",
+    "crates/chat",
+    "crates/cpu",
+    "crates/runtime",
+    "crates/serve",
+    "engine",
+]
 
-[dependencies]
-# Zero-copy weight access from GGUF files
-memmap2 = "0.9"
-# Safe casting between byte slices and POD block structs
+[workspace.dependencies]
 bytemuck = { version = "1.20", features = ["derive"] }
-# Runtime dlopen of libamdhip64.so / librocblas.so
-libloading = "0.8"
-# Library error types
 thiserror = "2.0"
-# Application-level error chaining (CLI / main)
-anyhow = "1.0"
-# CLI parsing
-clap = { version = "4.5", features = ["derive"] }
-# Source-hash for kernel cache invalidation
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
-# Parallelism for the CPU oracle (matvec across output rows)
-rayon = "1.10"
-# Pre-tokenizer regex for the BPE encoder (needs lookahead, which the
-# linear-time `regex` crate doesn't support)
-fancy-regex = "0.14"
-# JSONL ingest for the dump-traces drafter-training data dumper
-serde_json = "1.0"
-# f16 conversion for the trace binary format (hidden states stored fp16)
-half = "2.4"
-# Structured logging; level control via RUST_LOG (default `info`)
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+memmap2 = "0.9"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+rayon = "1.10"
+half = "2.4"
+fancy-regex = "0.14"
+serde_json = "1.0"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
-codegen-units = 1
+codegen-units = 16
 debug = "line-tables-only"
 
+# Binary crate: single codegen unit for maximum optimization.
+[profile.release.package."reinstinct-engine"]
+codegen-units = 1
+
 [profile.dev]
-# Speed up debug builds; we rely on tests for correctness
 opt-level = 1
