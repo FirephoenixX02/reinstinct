@@ -1,0 +1,31 @@
+[package]
+name = "reinstinct-engine"
+version = "0.1.0"
+edition = "2024"
+description = "Custom HIP inference engine for AMD MI50/MI60 (gfx906)"
+license = "Apache-2.0"
+
+[[bin]]
+name = "reinstinct-engine"
+path = "src/main.rs"
+
+[dependencies]
+reinstinct-hip = { path = "../crates/hip" }
+reinstinct-gguf = { path = "../crates/gguf" }
+reinstinct-quant = { path = "../crates/quant" }
+reinstinct-model = { path = "../crates/model" }
+reinstinct-cpu = { path = "../crates/cpu" }
+reinstinct-runtime = { path = "../crates/runtime" }
+reinstinct-serve = { path = "../crates/serve" }
+reinstinct-sampling = { path = "../crates/sampling" }
+reinstinct-tokenizer = { path = "../crates/tokenizer" }
+reinstinct-chat = { path = "../crates/chat" }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json.workspace = true
+half.workspace = true
+
+[dev-dependencies]
+memmap2.workspace = true

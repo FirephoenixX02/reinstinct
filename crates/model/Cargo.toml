@@ -1,0 +1,8 @@
+[package]
+name = "reinstinct-model"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+reinstinct-gguf = { path = "../gguf" }
+thiserror.workspace = true

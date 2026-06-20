@@ -1,0 +1,9 @@
+[package]
+name = "reinstinct-tokenizer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+reinstinct-gguf = { path = "../gguf" }
+fancy-regex.workspace = true
+tracing.workspace = true

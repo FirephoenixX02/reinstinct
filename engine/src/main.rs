@@ -1,0 +1,2665 @@
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+use reinstinct_cpu::qwen3_5::{ForwardTrace, Qwen35F32Model};
+use reinstinct_gguf::{GgufFile, MetaValue};
+use reinstinct_model::qwen3_5::{BlockKind, Qwen35Model};
+
+#[derive(Parser, Debug)]
+#[command(name = "reinstinct-engine", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Print header, metadata, and a tensor-type histogram for a GGUF file.
+    Inspect {
+        path: PathBuf,
+        /// Show every tensor (default: histogram + top-10 by size).
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Detect architecture and parse as a typed model (currently: qwen35 only).
+    Model {
+        path: PathBuf,
+    },
+    /// Run the forward pass on one or more input tokens, print top-K logits.
+    Generate {
+        path: PathBuf,
+        /// Input token id. Defaults to the model's EOS token id from metadata.
+        /// Ignored if --tokens is provided.
+        #[arg(short, long)]
+        token: Option<u32>,
+        /// Comma-separated list of token ids to feed in order. Logits are
+        /// printed for the LAST position. Overrides --token.
+        #[arg(long, value_delimiter = ',')]
+        tokens: Option<Vec<u32>>,
+        /// Number of top logits to print.
+        #[arg(short, long, default_value_t = 10)]
+        k: usize,
+        /// Run on the GPU (HIP) instead of the CPU oracle.
+        #[arg(long)]
+        gpu: bool,
+    },
+    /// Sample tokens autoregressively from a prompt — single token or
+    /// comma-separated prefill, then `--steps` newly generated tokens.
+    GenerateText {
+        path: PathBuf,
+        /// Prompt as text — encoded via the GGUF BPE tokenizer.
+        /// Takes precedence over --tokens.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Gemma 4 chat-template system message (rendered with the model's
+        /// chat template; only `gemma4` models). Overrides --prompt when set.
+        #[arg(long)]
+        system: Option<String>,
+        /// Gemma 4 chat-template user message (paired with --system). Falls
+        /// back to --prompt's content if not given.
+        #[arg(long)]
+        user: Option<String>,
+        /// Comma-separated prompt tokens. Defaults to [eos_token_id].
+        #[arg(long, value_delimiter = ',')]
+        tokens: Option<Vec<u32>>,
+        /// Number of new tokens to sample after the prompt is consumed.
+        #[arg(short = 'n', long, default_value_t = 32)]
+        steps: usize,
+        /// Sampling temperature (0 = greedy/argmax).
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+        /// Top-k filter (0 = no filter, full vocab).
+        #[arg(long, default_value_t = 40)]
+        top_k: usize,
+        /// PRNG seed.
+        #[arg(long, default_value_t = 0xC0FFEE)]
+        seed: u64,
+        /// Run on GPU.
+        #[arg(long)]
+        gpu: bool,
+    },
+    /// Speculative decode against a Gemma 4 target using its MTP drafter.
+    /// Currently sequential-verify (correctness, no speedup) — proves the
+    /// accept/reject loop end-to-end; the batched-verify perf win lands
+    /// when prefill_forward grows incremental positions.
+    MtpGen {
+        target: PathBuf,
+        drafter: PathBuf,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        system: Option<String>,
+        /// Drafted tokens per spec-decode round. K=3 is the empirical
+        /// sweet spot on Gemma 31B + MI50: best tok/s on capital /
+        /// primes / tea prompts, only marginally behind K=2 on math
+        /// (100% accept) and K=4 on haiku (where the drafter struggles
+        /// regardless). See scripts/bench-all.sh output for the sweep.
+        #[arg(long, default_value_t = 3)]
+        k: usize,
+        /// Total tokens to generate (round trip until this many accepted).
+        #[arg(short = 'n', long, default_value_t = 64)]
+        steps: usize,
+        /// Sampling temperature. `0` = greedy (strict argmax match accept).
+        /// `> 0` switches to rejection-sampling acceptance (accept with
+        /// probability min(1, p_target/p_draft); residual sample on reject).
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+        #[arg(long, default_value_t = 0xC0FFEE)]
+        seed: u64,
+    },
+    /// Spec-decode smoke test: load a Gemma 4 target + its MTP drafter,
+    /// prefill a prompt, then ask the drafter to propose K tokens at the
+    /// prompt's last position. Prints each drafted token plus the
+    /// target's own next-token prediction so the two can be compared.
+    /// First-cut diagnostic for the MTP drafter — no acceptance loop /
+    /// KV truncate / speedup yet.
+    MtpDraft {
+        target: PathBuf,
+        drafter: PathBuf,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        system: Option<String>,
+        #[arg(long, default_value_t = 4)]
+        k: usize,
+    },
+    /// Multi-turn chat against a Gemma 4 model with KV-cache prefix
+    /// reuse: the system message is prefilled and snapshotted once,
+    /// then each `--turn` reuses the snapshot — TTFT drops to the
+    /// per-turn token count instead of the full conversation.
+    Chat {
+        path: PathBuf,
+        /// Gemma 4 system message (rendered with the chat template).
+        #[arg(long)]
+        system: Option<String>,
+        /// Per-turn user input. Pass multiple times to demonstrate
+        /// prefix reuse — turn 2+ restores from the snapshot rather
+        /// than re-prefilling the system.
+        #[arg(long = "turn")]
+        turns: Vec<String>,
+        /// Decode tokens per turn.
+        #[arg(short = 'n', long, default_value_t = 60)]
+        steps: usize,
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+        #[arg(long, default_value_t = 40)]
+        top_k: usize,
+        #[arg(long, default_value_t = 0xC0FFEE)]
+        seed: u64,
+    },
+    /// Dump diagnostic stats for the embedding row of one or more tokens.
+    DebugEmbed {
+        path: PathBuf,
+        tokens: Vec<u32>,
+    },
+    /// Run forward N times, report per-stage timing breakdown.
+    Bench {
+        path: PathBuf,
+        #[arg(short = 'n', long, default_value_t = 5)]
+        iters: usize,
+        #[arg(short, long)]
+        token: Option<u32>,
+    },
+    /// Print HIP devices, VRAM, and time a host↔device round-trip.
+    HipInfo {
+        /// MB per copy direction in the bandwidth probe.
+        #[arg(long, default_value_t = 64)]
+        mb: usize,
+        /// Round-trip iterations to average bandwidth over.
+        #[arg(long, default_value_t = 8)]
+        iters: usize,
+    },
+    /// Time `forward_token` on the GPU and compare to the CPU baseline.
+    GpuBench {
+        path: PathBuf,
+        #[arg(short = 'n', long, default_value_t = 20)]
+        iters: usize,
+        #[arg(short, long)]
+        token: Option<u32>,
+    },
+    /// Run a multi-model HTTP server: Big LLM, Small LLM, and Embedder,
+    /// each on its own port, requests served in order through one GPU.
+    Serve {
+        /// Big model GGUF (~30B dense — Qwen 3.x or Gemma 4 31B).
+        #[arg(long)]
+        big: PathBuf,
+        /// Optional MTP drafter for the big model (Gemma 4 only).
+        /// When present, /v1/completions on the big port accepts a
+        /// `use_speculative: bool` JSON field (default: true). Set false
+        /// to opt out per-request — e.g. for creative-writing turns
+        /// where the drafter typically has low accept rate.
+        #[arg(long)]
+        big_drafter: Option<PathBuf>,
+        /// Small model GGUF (Qwen 3.5 4B or Gemma E4B). Optional — omit to
+        /// skip the small-model port and save VRAM.
+        #[arg(long)]
+        small: Option<PathBuf>,
+        /// Embedder GGUF (nomic-embed). Accepted but deferred — its
+        /// port answers 503 until the encoder runtime lands.
+        #[arg(long)]
+        embed: Option<PathBuf>,
+        #[arg(long, default_value_t = 8080)]
+        big_port: u16,
+        #[arg(long, default_value_t = 8081)]
+        small_port: u16,
+        #[arg(long, default_value_t = 8082)]
+        embed_port: u16,
+        /// Context window (prompt + generated tokens) per request.
+        #[arg(long, default_value_t = 4096)]
+        max_seq: usize,
+    },
+    /// QMTP-1 diagnostic: load a Qwen 3.6 MTP model, prefill a prompt,
+    /// then decode N tokens with the main model while running the
+    /// in-GGUF "nextn" MTP head alongside. Reports the K=1 spec-decode
+    /// accept rate — the fraction of MTP drafts that match the main
+    /// model's own next token. No acceptance loop / speedup yet.
+    QwenMtpProbe {
+        path: PathBuf,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(short = 'n', long, default_value_t = 64)]
+        steps: usize,
+    },
+    /// QMTP-2 check: verify that `forward_tokens_verify` (the batched
+    /// K-token verify forward) produces the same per-position argmax as
+    /// decoding those tokens one at a time. Self-consistency gate for
+    /// the MTP spec-decode verify path.
+    QwenVerifyCheck {
+        path: PathBuf,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(short = 'k', long, default_value_t = 8)]
+        k: usize,
+    },
+    /// QMTP-3: generate text with MTP speculative decoding on a Qwen
+    /// MTP model — chained drafts, batched all-or-nothing verify, GDN
+    /// state rollback. Reports accept rate + decode tok/s against a
+    /// plain single-token-decode baseline.
+    QwenMtpGen {
+        path: PathBuf,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(short = 'n', long, default_value_t = 128)]
+        tokens: usize,
+        /// MTP drafts chained per round.
+        #[arg(short = 'k', long, default_value_t = 2)]
+        k: usize,
+    },
+    /// End-to-end SuperQuant pipeline benchmark on synthetic K/V data.
+    /// Allocates a SuperQuantKvCache (2-tier: Warm int8 / Cold turbo3),
+    /// fills it via `write_step`, then runs the 2-tier attention kernel.
+    /// Reports per-stage timing + attention rel-L2 vs pure fp32.
+    ///
+    /// For real-model SuperQuant runs use `generate-text` with
+    /// REINSTINCT_KV_SUPERQUANT=1; this command always exercises
+    /// SuperQuant on synthetic tensors (no model needed).
+    SuperquantBench {
+        /// int8 Warm tier capacity (token positions).
+        #[arg(long, default_value_t = 2048)]
+        warm_cap: usize,
+        /// turbo3 Cold tier capacity (token positions).
+        #[arg(long, default_value_t = 4096)]
+        cold_cap: usize,
+        /// Number of KV heads to simulate (per-layer count).
+        #[arg(long, default_value_t = 2)]
+        n_kv: usize,
+        /// Query head count (must be a multiple of n_kv for GQA).
+        #[arg(long, default_value_t = 16)]
+        n_heads: usize,
+        /// Per-head dimension (multiple of 128 for the RHT group size).
+        #[arg(long, default_value_t = 256)]
+        head_dim: usize,
+        /// Number of positions to write before running attention.
+        /// Caps to (hot_cap + warm_cap + cold_cap).
+        #[arg(long, default_value_t = 4096)]
+        n_writes: usize,
+        /// FlashDecoding split count for the attention kernel.
+        #[arg(long, default_value_t = 8)]
+        n_splits: usize,
+    },
+    /// Lockstep argmax-alignment between two Gemma 4 models.
+    /// Prefills both with the same prompt (chat-templated), then steps
+    /// forward one token at a time. At each step both models predict the
+    /// next token from the SAME accepted prefix; we count argmax matches.
+    /// Reports the K=1 ceiling acceptance rate that a vanilla speculative
+    /// decode setup would see using `drafter` to draft for `target`.
+    /// Both KV caches advance with the TARGET's argmax, keeping the
+    /// drafter aligned exactly the way vanilla spec-decode would.
+    AlignCheck {
+        target: PathBuf,
+        drafter: PathBuf,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        system: Option<String>,
+        #[arg(short = 'n', long, default_value_t = 64)]
+        steps: usize,
+    },
+    /// Dump (prev_tok, label_tok, hidden_b[H]) training traces from a
+    /// Gemma 4 target over a JSONL of prompts. For training an EAGLE-
+    /// style drafter (see [[drafter-training-roadmap]] in memory).
+    /// Chat-template prefill per prompt, then greedy decode for `steps`
+    /// tokens, capturing the target's POST output-norm hidden state plus
+    /// the next-token label at each step. Hidden states stored as fp16.
+    /// Resume: scans the output file for completed seq_ids and skips them.
+    DumpTraces {
+        target: PathBuf,
+        /// Path to JSONL with {"prompt": str, "seq_id": u32, ...} per line.
+        #[arg(long)]
+        prompts: PathBuf,
+        /// Output binary file (appended; supports resume).
+        #[arg(long)]
+        out: PathBuf,
+        /// Tokens to decode per prompt (may finish earlier on EOS).
+        #[arg(short = 'n', long, default_value_t = 64)]
+        steps: usize,
+        /// Skip prompts with seq_id below this (additional manual offset).
+        #[arg(long, default_value_t = 0)]
+        skip: u32,
+        /// Stop after this many prompts have been processed in this run
+        /// (0 = no cap; resume picks up where the file ends).
+        #[arg(long, default_value_t = 0)]
+        limit: u32,
+    },
+}
+
+fn main() -> anyhow::Result<()> {
+    // Logging: RUST_LOG controls level/targets (e.g. RUST_LOG=debug or
+    // RUST_LOG=reinstinct_engine::serve=debug); default `info` keeps the
+    // pre-tracing stderr behaviour.
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+        .with_writer(std::io::stderr)
+        .init();
+
+    match Cli::parse().cmd {
+        Command::Inspect { path, verbose } => inspect(&path, verbose),
+        Command::Model { path } => model(&path),
+        Command::Generate { path, token, tokens, k, gpu } => generate(&path, token, tokens, k, gpu),
+        Command::DebugEmbed { path, tokens } => debug_embed(&path, &tokens),
+        Command::Bench { path, iters, token } => bench(&path, iters, token),
+        Command::HipInfo { mb, iters } => hip_info(mb, iters),
+        Command::GpuBench { path, iters, token } => gpu_bench(&path, iters, token),
+        Command::Serve { big, big_drafter, small, embed,
+                         big_port, small_port, embed_port, max_seq } =>
+            reinstinct_serve::run(big, big_drafter, small, embed,
+                                          big_port, small_port, embed_port, max_seq)
+                .map_err(anyhow::Error::msg),
+        Command::GenerateText { path, prompt, system, user, tokens, steps,
+                                temperature, top_k, seed, gpu } =>
+            generate_text(&path, prompt, system, user, tokens, steps,
+                          temperature, top_k, seed, gpu),
+        Command::Chat { path, system, turns, steps, temperature, top_k, seed } =>
+            chat_gemma4_cli(&path, system, turns, steps, temperature, top_k, seed),
+        Command::SuperquantBench { warm_cap, cold_cap, n_kv,
+                                    n_heads, head_dim, n_writes, n_splits } =>
+            superquant_bench_cli(warm_cap, cold_cap, n_kv, n_heads,
+                                 head_dim, n_writes, n_splits),
+        Command::MtpDraft { target, drafter, prompt, system, k } =>
+            mtp_draft_cli(&target, &drafter, prompt, system, k),
+        Command::MtpGen { target, drafter, prompt, system, k, steps, temperature, seed } =>
+            mtp_gen_cli(&target, &drafter, prompt, system, k, steps, temperature, seed),
+        Command::QwenMtpProbe { path, prompt, steps } =>
+            qwen_mtp_probe_cli(&path, prompt, steps),
+        Command::QwenVerifyCheck { path, prompt, k } =>
+            qwen_verify_check_cli(&path, prompt, k),
+        Command::QwenMtpGen { path, prompt, tokens, k } =>
+            qwen_mtp_gen_cli(&path, prompt, tokens, k),
+        Command::AlignCheck { target, drafter, prompt, system, steps } =>
+            align_check_cli(&target, &drafter, prompt, system, steps),
+        Command::DumpTraces { target, prompts, out, steps, skip, limit } =>
+            dump_traces_cli(&target, &prompts, &out, steps, skip, limit),
+    }
+}
+
+/// Lockstep two GpuGemma4 forwards, advancing both with the target's
+/// argmax. Returns (accepted, total) — total is `steps`, accepted is the
+/// count of positions where the drafter's argmax matched the target's.
+fn align_check_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
+                   prompt_text: Option<String>, system: Option<String>,
+                   steps: usize) -> anyhow::Result<()>
+{
+    use reinstinct_chat::{ChatMessage, Role, format_gemma4};
+    use reinstinct_hip;
+    use reinstinct_model::gemma4::Gemma4Model;
+    use reinstinct_runtime::{KernelCache, gemma4::{GpuGemma4, Gemma4GpuState}};
+    use reinstinct_tokenizer::GemmaTokenizer;
+
+    let target_gguf  = GgufFile::open(target_path)?;
+    let drafter_gguf = GgufFile::open(drafter_path)?;
+    let tok = GemmaTokenizer::from_gguf(&target_gguf).map_err(anyhow::Error::msg)?;
+
+    let prompt: Vec<u32> = if let Some(s) = &system {
+        let user = prompt_text.clone().unwrap_or_default();
+        let msgs = vec![
+            ChatMessage { role: Role::System, content: s.clone() },
+            ChatMessage { role: Role::User,   content: user },
+        ];
+        format_gemma4(&tok, &msgs, true).map_err(anyhow::Error::msg)?
+    } else if let Some(t) = &prompt_text {
+        let mut ids = vec![tok.bos_id];
+        ids.extend(tok.encode(t));
+        ids
+    } else {
+        anyhow::bail!("align-check: pass --prompt or --system/--prompt");
+    };
+
+    if reinstinct_hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+    let _dev = reinstinct_hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+
+    let t_model = Gemma4Model::load(&target_gguf).map_err(anyhow::Error::msg)?;
+    let d_model = Gemma4Model::load(&drafter_gguf).map_err(anyhow::Error::msg)?;
+    let max_seq = prompt.len() + steps + 8;
+    let t_gm = GpuGemma4::new(&t_model, &target_gguf,  &cache, max_seq)
+        .map_err(anyhow::Error::msg)?;
+    let d_gm = GpuGemma4::new(&d_model, &drafter_gguf, &cache, max_seq)
+        .map_err(anyhow::Error::msg)?;
+    let mut t_state = Gemma4GpuState::new(&t_model, max_seq).map_err(anyhow::Error::msg)?;
+    let mut d_state = Gemma4GpuState::new(&d_model, max_seq).map_err(anyhow::Error::msg)?;
+    t_state.reset(); d_state.reset();
+
+    println!("target  = {} ({} layers, {} hidden)",
+             target_path.display(), t_model.config.block_count, t_model.config.hidden_size);
+    println!("drafter = {} ({} layers, {} hidden)",
+             drafter_path.display(), d_model.config.block_count, d_model.config.hidden_size);
+    println!("prompt  = {} tokens, steps = {}", prompt.len(), steps);
+
+    if d_model.config.vocab_size != t_model.config.vocab_size {
+        anyhow::bail!("vocab mismatch: target={} drafter={}",
+                      t_model.config.vocab_size, d_model.config.vocab_size);
+    }
+
+    // Prefill both — last forward leaves verify_logits = next-token logits.
+    let t_pf = std::time::Instant::now();
+    let _ = t_gm.prefill_forward(&prompt[..prompt.len()-1], &mut t_state)
+        .map_err(anyhow::Error::msg)?;
+    let mut t_logits = t_gm.forward_token(*prompt.last().unwrap(), &mut t_state)
+        .map_err(anyhow::Error::msg)?;
+    let _ = d_gm.prefill_forward(&prompt[..prompt.len()-1], &mut d_state)
+        .map_err(anyhow::Error::msg)?;
+    let mut d_logits = d_gm.forward_token(*prompt.last().unwrap(), &mut d_state)
+        .map_err(anyhow::Error::msg)?;
+    println!("prefill (both) = {:.0} ms", t_pf.elapsed().as_secs_f64() * 1e3);
+
+    // Step in lockstep: at each step argmax both, count match, advance BOTH
+    // with target's argmax (= what vanilla spec-decode would commit).
+    let argmax = |v: &Vec<f32>| -> u32 {
+        let mut best = 0; let mut bv = f32::NEG_INFINITY;
+        for (i, &x) in v.iter().enumerate() { if x > bv { bv = x; best = i; } }
+        best as u32
+    };
+
+    let eos = t_model.config.eos_token_id;
+    let mut accepted = 0usize;
+    let mut total = 0usize;
+    let mut accepted_text: Vec<u32> = Vec::new();
+    for _ in 0..steps {
+        let t_tok = argmax(&t_logits);
+        let d_tok = argmax(&d_logits);
+        total += 1;
+        if d_tok == t_tok { accepted += 1; }
+        accepted_text.push(t_tok);
+        if t_tok == eos { break; }
+        // Advance both states with TARGET's token (vanilla-spec alignment).
+        t_logits = t_gm.forward_token(t_tok, &mut t_state).map_err(anyhow::Error::msg)?;
+        d_logits = d_gm.forward_token(t_tok, &mut d_state).map_err(anyhow::Error::msg)?;
+    }
+
+    let pct = 100.0 * accepted as f64 / total as f64;
+    println!("argmax accept rate: {accepted} / {total} = {pct:.1}%");
+    println!("target text: {:?}", tok.decode(&accepted_text));
+    Ok(())
+}
+
+// ===== dump-traces — EAGLE drafter training data dumper =====
+//
+// Binary trace format (little-endian, mmap-friendly):
+//
+//   File header (32 B):
+//     magic[8]          = b"RTRC0001"
+//     hidden_size: u32  = target's hidden dim (5376 for Gemma 31B)
+//     steps_per_prompt: u32 = command-line `--steps` value
+//     n_prompts: u32    = monotonically incremented as prompts complete
+//                         (caller must seek to byte 16 and overwrite this
+//                         field after each prompt — supports clean resume)
+//     flags: u32        = reserved (0)
+//     _pad: u64         = 0
+//
+//   Per-prompt record (16 B header + n_steps × per-step):
+//     seq_id: u32       = prompt seq_id from input JSONL
+//     prompt_len: u32   = encoded prompt token count
+//     n_steps: u32      = ACTUAL steps generated (≤ steps_per_prompt;
+//                         can be less if EOS hit early)
+//     _pad: u32
+//
+//   Per-step record (8 + 2·hidden_size B):
+//     prev_tok: u32     = the token fed into target at this step
+//     label_tok: u32    = target's argmax (= what the drafter should
+//                         predict; this becomes prev_tok at step+1)
+//     hidden_b[H]: f16  = target's POST output-norm hidden state AFTER
+//                         processing prev_tok (= the drafter's expected
+//                         pre_projection h_prev input — see gemma4-mtp
+//                         PRE-vs-POST norm finding)
+//
+// At H=5376 and steps=64: 32 (file hdr) + 50_000 × (16 + 64 × 10760)
+// ≈ 32.9 GB for the full 50k-prompt run.
+//
+// Resume strategy: on startup, scan the existing file to learn which
+// seq_ids have been written (the header's n_prompts count is the source
+// of truth; we read it + walk through that many prompt-records to skip
+// past them, then append). Re-running with --skip is also supported as
+// a manual override.
+
+const TRACE_MAGIC: &[u8; 8] = b"RTRC0001";
+const TRACE_HEADER_BYTES: u64 = 32;
+
+fn dump_traces_cli(target_path: &std::path::Path, prompts_path: &std::path::Path,
+                   out_path: &std::path::Path, steps: usize, skip: u32,
+                   limit: u32) -> anyhow::Result<()>
+{
+    use reinstinct_chat::{ChatMessage, Role, format_gemma4};
+    use reinstinct_hip;
+    use reinstinct_model::gemma4::Gemma4Model;
+    use reinstinct_runtime::{KernelCache, gemma4::{GpuGemma4, Gemma4GpuState}};
+    use reinstinct_tokenizer::GemmaTokenizer;
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+    use std::fs::OpenOptions;
+
+    if steps == 0 || steps > 256 { anyhow::bail!("--steps must be in 1..=256"); }
+
+    let target_gguf = GgufFile::open(target_path)?;
+    let tok = GemmaTokenizer::from_gguf(&target_gguf).map_err(anyhow::Error::msg)?;
+
+    if reinstinct_hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+    let _dev = reinstinct_hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+
+    let model = Gemma4Model::load(&target_gguf).map_err(anyhow::Error::msg)?;
+    let hidden = model.config.hidden_size as usize;
+    let eos = model.config.eos_token_id;
+    let max_seq_per_prompt = 2048;   // prompt header alone caps at ~1500 chars
+    let gm = GpuGemma4::new(&model, &target_gguf, &cache, max_seq_per_prompt)
+        .map_err(anyhow::Error::msg)?;
+
+    // --- Open output, write/validate header, learn resume cursor. ---
+    let mut out = OpenOptions::new().read(true).write(true).create(true).open(out_path)?;
+    let existing_len = out.metadata()?.len();
+    let mut already_done_seqs: std::collections::HashSet<u32> = Default::default();
+    if existing_len == 0 {
+        // Fresh file: write header.
+        let mut hdr = [0u8; TRACE_HEADER_BYTES as usize];
+        hdr[..8].copy_from_slice(TRACE_MAGIC);
+        hdr[ 8..12].copy_from_slice(&(hidden as u32).to_le_bytes());
+        hdr[12..16].copy_from_slice(&(steps as u32).to_le_bytes());
+        hdr[16..20].copy_from_slice(&0u32.to_le_bytes());   // n_prompts; updated as we go
+        // flags + pad = zero
+        out.write_all(&hdr)?;
+        out.flush()?;
+        println!("[dump-traces] fresh file → {} (hidden={hidden}, steps={steps})",
+                 out_path.display());
+    } else {
+        // Resume: validate header, then walk records to collect done seq_ids.
+        out.seek(SeekFrom::Start(0))?;
+        let mut hdr = [0u8; TRACE_HEADER_BYTES as usize];
+        out.read_exact(&mut hdr)?;
+        if &hdr[..8] != TRACE_MAGIC { anyhow::bail!("trace file magic mismatch"); }
+        let h_hidden = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
+        let h_steps  = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
+        if h_hidden != hidden {
+            anyhow::bail!("trace file hidden={h_hidden} != target hidden={hidden}");
+        }
+        if h_steps != steps {
+            anyhow::bail!("trace file steps={h_steps} != cli --steps={steps} (would corrupt format)");
+        }
+        let n_done = u32::from_le_bytes(hdr[16..20].try_into().unwrap()) as usize;
+        // Walk forward to collect seq_ids that are already in the file.
+        let mut pos = TRACE_HEADER_BYTES;
+        for _ in 0..n_done {
+            out.seek(SeekFrom::Start(pos))?;
+            let mut prec = [0u8; 16];
+            out.read_exact(&mut prec)?;
+            let sid = u32::from_le_bytes(prec[0..4].try_into().unwrap());
+            let n_steps_this = u32::from_le_bytes(prec[8..12].try_into().unwrap()) as u64;
+            already_done_seqs.insert(sid);
+            pos += 16 + n_steps_this * (8 + 2 * hidden as u64);
+        }
+        out.seek(SeekFrom::End(0))?;
+        println!("[dump-traces] resume: {n_done} prompts already in {} ({} bytes); skipping their seq_ids",
+                 out_path.display(), existing_len);
+    }
+    let mut n_done_total = already_done_seqs.len() as u32;
+
+    // Allocate the KV-cache state ONCE and reuse it across all prompts.
+    // Earlier version allocated inside the per-prompt loop; HIP's allocator
+    // fragments HBM after a few hundred 1.5 GB alloc/free cycles and OOMs.
+    let mut state = Gemma4GpuState::new(&model, max_seq_per_prompt)
+        .map_err(anyhow::Error::msg)?;
+
+    // --- Iterate JSONL. ---
+    let f = std::fs::File::open(prompts_path)?;
+    let rdr = BufReader::new(f);
+    let mut processed_this_run = 0u32;
+    let t_start = std::time::Instant::now();
+
+    for line in rdr.lines() {
+        let line = line?;
+        if line.trim().is_empty() { continue; }
+        // Quick-and-dirty extract — JSON parse only for the fields we need.
+        let v: serde_json::Value = serde_json::from_str(&line)?;
+        let seq_id = v.get("seq_id").and_then(|x| x.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("missing seq_id in line"))? as u32;
+        let prompt_text = v.get("prompt").and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing prompt in line"))?;
+        if seq_id < skip { continue; }
+        if already_done_seqs.contains(&seq_id) { continue; }
+        if limit > 0 && processed_this_run >= limit { break; }
+
+        // Chat-template the prompt (matches mtp-gen behaviour so the
+        // trace matches what the drafter will see at inference time).
+        let msgs = vec![
+            ChatMessage { role: Role::System, content: String::new() },
+            ChatMessage { role: Role::User,   content: prompt_text.to_owned() },
+        ];
+        let prompt: Vec<u32> = format_gemma4(&tok, &msgs, true)
+            .map_err(anyhow::Error::msg)?;
+        if prompt.len() + steps + 8 > max_seq_per_prompt {
+            eprintln!("[dump-traces] WARN: seq_id={seq_id} prompt+steps would exceed \
+                       max_seq ({}+{}>= {max_seq_per_prompt}); skipping",
+                       prompt.len(), steps);
+            continue;
+        }
+
+        // Reset KV cache for this prompt (state buffers are reused — see
+        // the hoisted allocation above the loop).
+        state.reset();
+        // Use the batched prefill (fast). The PrefillGemm path allocates a
+        // fresh DeviceBuf result per matmul which fragments HBM after a
+        // few hundred prompts of varying length — handled here by the
+        // CLI's `--limit` flag + an outer restart-wrapper. Process exits
+        // cleanly with a captured count; relaunching resumes via the file
+        // header counter.
+        let _ = gm.prefill_forward(&prompt[..prompt.len()-1], &mut state)
+            .map_err(anyhow::Error::msg)?;
+        let mut logits = gm.forward_token(*prompt.last().unwrap(), &mut state)
+            .map_err(anyhow::Error::msg)?;
+
+        // Generate up to `steps` tokens; at each step record (prev, label, h_b).
+        let mut rec_bytes: Vec<u8> = Vec::with_capacity(steps * (8 + 2 * hidden));
+        let mut prev = *prompt.last().unwrap();
+        let mut n_steps_this = 0u32;
+        let mut hidden_buf = vec![0.0f32; hidden];
+        for _ in 0..steps {
+            // hidden_b currently reflects the forward we just did (for `prev`).
+            // Read it BEFORE the next forward overwrites it.
+            gm.last_hidden_state()  // ensures buffer is valid
+                .copy_to_host(&mut hidden_buf).map_err(anyhow::Error::msg)?;
+            let label = argmax(&logits);
+            // Append step record: prev, label, fp16(hidden_b)
+            rec_bytes.extend_from_slice(&prev.to_le_bytes());
+            rec_bytes.extend_from_slice(&label.to_le_bytes());
+            for &v in &hidden_buf {
+                let h = half::f16::from_f32(v);
+                rec_bytes.extend_from_slice(&h.to_le_bytes());
+            }
+            n_steps_this += 1;
+            if label == eos { break; }
+            // Advance: feed the label token, get next logits + new hidden_b.
+            prev = label;
+            logits = gm.forward_token(prev, &mut state).map_err(anyhow::Error::msg)?;
+        }
+
+        // Write prompt header + step records.
+        let mut prec = [0u8; 16];
+        prec[0..4].copy_from_slice(&seq_id.to_le_bytes());
+        prec[4..8].copy_from_slice(&(prompt.len() as u32).to_le_bytes());
+        prec[8..12].copy_from_slice(&n_steps_this.to_le_bytes());
+        out.write_all(&prec)?;
+        out.write_all(&rec_bytes)?;
+        n_done_total += 1;
+        processed_this_run += 1;
+
+        // Update the header's n_prompts counter so a kill-mid-run leaves
+        // a consistent file (resumes find the right cursor).
+        out.flush()?;
+        out.seek(SeekFrom::Start(16))?;
+        out.write_all(&n_done_total.to_le_bytes())?;
+        out.seek(SeekFrom::End(0))?;
+
+        if processed_this_run % 50 == 0 {
+            let dt = t_start.elapsed().as_secs_f64();
+            let rate = processed_this_run as f64 / dt;
+            eprintln!("[dump-traces] +{processed_this_run} prompts in {dt:.1}s \
+                       ({rate:.2} prompt/s, total in file: {n_done_total})");
+        }
+    }
+
+    let dt = t_start.elapsed().as_secs_f64();
+    eprintln!("[dump-traces] done: +{processed_this_run} prompts this run in {dt:.1}s; \
+               file now has {n_done_total} total prompts");
+    Ok(())
+}
+
+fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
+                 system: Option<String>, user: Option<String>,
+                 tokens: Option<Vec<u32>>, steps: usize,
+                 temperature: f32, top_k: usize, seed: u64, gpu: bool) -> anyhow::Result<()> {
+    use reinstinct_sampling::{Rng, sample_temp_topk};
+    use reinstinct_tokenizer::Tokenizer;
+
+    let g = GgufFile::open(path)?;
+    let arch = g.metadata_get("general.architecture")
+        .and_then(|v| v.as_str()).unwrap_or("<unknown>");
+    if arch == "gemma4" {
+        return generate_text_gemma4(&g, path, prompt_text, system, user, tokens,
+                                    steps, temperature, top_k, seed, gpu);
+    }
+    // Both qwen and gemma4 support --system / --user via their respective
+    // chat templates. Other architectures don't have one wired yet.
+    let is_qwen = matches!(arch, "qwen35" | "qwen35moe");
+    // Typed model — config + quantized tensor refs only. The f32
+    // CPU oracle (Qwen35F32Model) is loaded lazily in the CPU branch;
+    // building it for --gpu would needlessly materialise the whole
+    // model in host RAM (87 GB+ on a 27B model — OOM).
+    let model = Qwen35Model::load(&g)?;
+    let cfg = &model.config;
+
+    // Prompt resolution:
+    //   --system/--user (qwen chat template) > --prompt text > --tokens > [EOS].
+    let prompt: Vec<u32> = if system.is_some() || user.is_some() {
+        if !is_qwen {
+            anyhow::bail!("--system / --user not supported for {arch}; only gemma4 and qwen35.");
+        }
+        use reinstinct_chat::{ChatMessage, Role, format_qwen3};
+        let tok = Tokenizer::from_gguf(&g).map_err(anyhow::Error::msg)?;
+        let user_text = user.clone()
+            .or_else(|| prompt_text.clone())
+            .ok_or_else(|| anyhow::anyhow!(
+                "--system was set but no user content (pass --user or --prompt)"))?;
+        let mut msgs: Vec<ChatMessage> = Vec::new();
+        if let Some(s) = &system {
+            msgs.push(ChatMessage { role: Role::System, content: s.clone() });
+        }
+        msgs.push(ChatMessage { role: Role::User, content: user_text });
+        format_qwen3(&tok, &msgs, true).map_err(anyhow::Error::msg)?
+    } else if let Some(text) = &prompt_text {
+        let tok = Tokenizer::from_gguf(&g).map_err(anyhow::Error::msg)?;
+        let ids = tok.encode(text);
+        if ids.is_empty() { anyhow::bail!("prompt encoded to zero tokens"); }
+        ids
+    } else {
+        tokens.unwrap_or_else(|| vec![cfg.eos_token_id])
+    };
+
+    println!("model       = {}", path.display());
+    println!("backend     = {}", if gpu { "GPU (HIP)" } else { "CPU" });
+    println!("prompt      = {prompt:?} ({} tokens)", prompt.len());
+    println!("steps       = {steps}");
+    println!("sampling    = temp={temperature} top_k={top_k} seed={seed}");
+    let max_seq = prompt.len() + steps + 4;
+    let mut rng = Rng::new(seed);
+    let mut all = prompt.clone();
+
+    let t0 = std::time::Instant::now();
+    if gpu {
+        use reinstinct_hip;
+        use reinstinct_runtime::{KernelCache, qwen35::{GpuQwen35, Qwen35GpuState}};
+        if reinstinct_hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+        let _dev = reinstinct_hip::Device::set(0).map_err(anyhow::Error::msg)?;
+        let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+        let gpu = GpuQwen35::new(&model, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
+        let mut state = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+
+        // REINSTINCT_PREFILL: batched-prefill benchmark — run the prefill,
+        // print timing + top-10, and exit (skips generation). Mirrors the
+        // gemma4 path so the harness has one interface for both arches.
+        if std::env::var_os("REINSTINCT_PREFILL").is_some() {
+            let do_twice = std::env::var_os("REINSTINCT_PREFILL_TWICE").is_some()
+                && prompt.len() > 1;
+            if do_twice {
+                // Warmup pass (cold pools → uncaptured), then a fresh-state
+                // second pass that uses the captured graph.
+                let mut s_warm = Qwen35GpuState::new(&model, max_seq)
+                    .map_err(anyhow::Error::msg)?;
+                let t1 = std::time::Instant::now();
+                let _ = gpu.forward_tokens_batched(&prompt, &mut s_warm)
+                    .map_err(anyhow::Error::msg)?;
+                let el1 = t1.elapsed().as_secs_f64();
+                println!("warmup prefill   = {:.1} ms  ({} tokens, {:.2} ms/token)",
+                         el1 * 1e3, prompt.len(), el1 * 1e3 / prompt.len() as f64);
+            }
+            let t = std::time::Instant::now();
+            let lg = if prompt.len() > 1 {
+                gpu.forward_tokens_batched(&prompt, &mut state).map_err(anyhow::Error::msg)?
+            } else {
+                gpu.forward_tokens(&prompt, &mut state).map_err(anyhow::Error::msg)?
+            };
+            let el = t.elapsed().as_secs_f64();
+            let label = if do_twice { "captured prefill" } else { "batched prefill " };
+            println!("{label} = {:.1} ms  ({} tokens, {:.2} ms/token)",
+                     el * 1e3, prompt.len(), el * 1e3 / prompt.len() as f64);
+            let mut idx: Vec<usize> = (0..lg.len()).collect();
+            idx.sort_unstable_by(|&a, &b| lg[b].partial_cmp(&lg[a]).unwrap());
+            for &t in idx.iter().take(10) {
+                println!("  token {t:>8}  logit {:>9.4}", lg[t]);
+            }
+            return Ok(());
+        }
+
+        // Prefill the prompt in one batched pass (rocBLAS GEMM); fall
+        // back to the sequential path for a single-token prompt.
+        let t_pre = std::time::Instant::now();
+        let mut logits = if prompt.len() > 1 {
+            gpu.forward_tokens_batched(&prompt, &mut state).map_err(anyhow::Error::msg)?
+        } else {
+            gpu.forward_tokens(&prompt, &mut state).map_err(anyhow::Error::msg)?
+        };
+        println!("prefill       = {:.3} s ({} tokens, batched)",
+            t_pre.elapsed().as_secs_f32(), prompt.len());
+        // Capture the decode forward into a parametric HIP graph — the
+        // graph reads `d_pos`, so one capture replays for every step,
+        // eliding the per-kernel launch overhead. `REINSTINCT_NO_GRAPH`
+        // forces the per-kernel path.
+        // REINSTINCT_MOE_PROFILE needs the per-kernel path (its per-stage
+        // timer syncs the stream, which a captured graph can't contain).
+        let use_graph = std::env::var_os("REINSTINCT_NO_GRAPH").is_none()
+                     && std::env::var_os("REINSTINCT_MOE_PROFILE").is_none();
+        // Capture only when the graph is used — the profiler's per-stage
+        // syncs cannot run inside a stream capture.
+        let graph = if use_graph {
+            Some(gpu.capture_forward_graph(&mut state).map_err(anyhow::Error::msg)?)
+        } else {
+            println!("backend mode  = per-kernel");
+            None
+        };
+        // Decode timer — steady-state per-token cost, excluding the
+        // one-time weight load and the prompt prefill.
+        let t_dec = std::time::Instant::now();
+        for _ in 0..steps {
+            let tok = sample_temp_topk(&logits, temperature, top_k, &mut rng);
+            all.push(tok);
+            if tok == cfg.eos_token_id { break; }
+            logits = match &graph {
+                Some(g) => gpu.forward_token_via_graph(g, tok, &mut state)
+                              .map_err(anyhow::Error::msg)?,
+                None    => gpu.forward_token(tok, &mut state).map_err(anyhow::Error::msg)?,
+            };
+        }
+        let n_dec = all.len() - prompt.len();
+        if n_dec > 0 {
+            let d = t_dec.elapsed().as_secs_f64();
+            println!("decode        = {:.1} ms/token ({:.1} tok/s) over {n_dec} forwards",
+                d * 1e3 / n_dec as f64, n_dec as f64 / d);
+        }
+        let prof = gpu.moe_prof_report();
+        if !prof.is_empty() {
+            let tot: f64 = prof.iter().map(|(_, t)| t).sum();
+            println!("\n--- MoE decode per-stage ({n_dec} steps, sync-per-lap) ---");
+            for (label, ms) in &prof {
+                println!("  {label:<14} {ms:8.1} ms  {:5.1}%  ({:.3} ms/step)",
+                         100.0 * ms / tot, ms / n_dec.max(1) as f64);
+            }
+            println!("  {:<14} {tot:8.1} ms", "TOTAL");
+        }
+    } else {
+        // CPU oracle — needs the f32-dequantized weights.
+        let m = Qwen35F32Model::load(&g)?;
+        let mut state = m.new_state(max_seq);
+        let mut logits = m.forward_tokens(&prompt, &mut state);
+        for _ in 0..steps {
+            let tok = sample_temp_topk(&logits, temperature, top_k, &mut rng);
+            all.push(tok);
+            if tok == cfg.eos_token_id { break; }
+            logits = m.forward_token(tok, &mut state);
+        }
+    }
+    let elapsed = t0.elapsed();
+    let new_tokens = all.len() - prompt.len();
+    println!("\ngenerated   = {} tokens in {:.2} s ({:.1} tok/s)",
+        new_tokens, elapsed.as_secs_f64(), new_tokens as f64 / elapsed.as_secs_f64());
+    println!("output ids  = {all:?}");
+
+    // Decode through the GGUF tokenizer if we can.
+    match reinstinct_tokenizer::Tokenizer::from_gguf(&g) {
+        Ok(tok) => {
+            println!("\n--- prompt ---\n{}", tok.decode(&prompt));
+            println!("\n--- generated ---\n{}", tok.decode(&all[prompt.len()..]));
+            println!("\n--- full output ---\n{}", tok.decode(&all));
+        }
+        Err(e) => println!("\n(tokenizer decode unavailable: {e})"),
+    }
+    Ok(())
+}
+
+/// Gemma 4 generation via the CPU oracle. Prompt is given as token ids
+/// (`--tokens`) — Gemma uses a SentencePiece tokenizer the engine's
+/// GPT2-style BPE module doesn't cover yet. Prints token ids + top-K.
+fn generate_text_gemma4(g: &GgufFile, path: &std::path::Path,
+                        prompt_text: Option<String>,
+                        system: Option<String>, user: Option<String>,
+                        tokens: Option<Vec<u32>>, steps: usize,
+                        temperature: f32, top_k: usize, seed: u64, gpu: bool) -> anyhow::Result<()> {
+    use reinstinct_sampling::{Rng, sample_temp_topk};
+    use reinstinct_cpu::gemma4::Gemma4CpuModel;
+    use reinstinct_model::gemma4::Gemma4Model;
+    use reinstinct_tokenizer::GemmaTokenizer;
+    use reinstinct_chat::{ChatMessage, Role, format_gemma4};
+
+    let cfg_eos = Gemma4Model::load(g).map_err(anyhow::Error::msg)?.config.eos_token_id;
+    // Gemma 4 SentencePiece tokenizer — encodes --prompt text and
+    // decodes the generated ids back to text.
+    let tok = GemmaTokenizer::from_gguf(g).ok();
+    let prompt: Vec<u32> = if system.is_some() || user.is_some() {
+        // Chat mode: assemble messages via the Gemma 4 chat template.
+        // --user falls back to --prompt's text so users can mix conventions.
+        let t = tok.as_ref().ok_or_else(||
+            anyhow::anyhow!("--system / --user: gemma4 tokenizer not available"))?;
+        let user_text = user.clone()
+            .or_else(|| prompt_text.clone())
+            .ok_or_else(|| anyhow::anyhow!(
+                "--system was set but no user content (pass --user or --prompt)"))?;
+        let mut msgs: Vec<ChatMessage> = Vec::new();
+        if let Some(s) = &system {
+            msgs.push(ChatMessage { role: Role::System, content: s.clone() });
+        }
+        msgs.push(ChatMessage { role: Role::User, content: user_text });
+        format_gemma4(t, &msgs, true).map_err(anyhow::Error::msg)?
+    } else if let Some(text) = &prompt_text {
+        let t = tok.as_ref().ok_or_else(||
+            anyhow::anyhow!("--prompt: this GGUF has no usable gemma4 tokenizer"))?;
+        let mut ids = vec![t.bos_id];
+        ids.extend(t.encode(text));
+        ids
+    } else {
+        tokens.unwrap_or_else(|| vec![cfg_eos])
+    };
+
+    println!("model       = {} (gemma4)", path.display());
+    println!("backend     = {}", if gpu { "GPU (HIP)" } else { "CPU oracle" });
+    println!("prompt      = {prompt:?} ({} tokens)", prompt.len());
+    println!("steps       = {steps}");
+
+    let mut rng = Rng::new(seed);
+    let mut all = prompt.clone();
+    let t0 = std::time::Instant::now();
+    let logits;
+
+    if gpu {
+        use reinstinct_hip;
+        use reinstinct_runtime::{KernelCache, gemma4::{GpuGemma4, Gemma4GpuState}};
+        if reinstinct_hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+        let _dev = reinstinct_hip::Device::set(0).map_err(anyhow::Error::msg)?;
+        let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+        let model = Gemma4Model::load(g).map_err(anyhow::Error::msg)?;
+        let max_seq = prompt.len() + steps + 8;
+        let t_load = std::time::Instant::now();
+        let gm = GpuGemma4::new(&model, g, &cache, max_seq).map_err(anyhow::Error::msg)?;
+        println!("weights load = {:.2} s", t_load.elapsed().as_secs_f32());
+
+        // SuperQuant opt-in: REINSTINCT_KV_SUPERQUANT=1 swaps in the
+        // 2-tier (int8 Warm + turbo3 Cold) KV cache. Sizing comes from
+        // optional REINSTINCT_KV_WARM_TOKENS / REINSTINCT_KV_COLD_TOKENS.
+        // Defaults via SuperQuantConfig::chat_defaults(max_seq).
+        let mut state = if std::env::var_os("REINSTINCT_KV_SUPERQUANT").is_some() {
+            use reinstinct_runtime::kv_superquant::SuperQuantConfig;
+            let mut cfg = SuperQuantConfig::chat_defaults(max_seq);
+            if let Ok(v) = std::env::var("REINSTINCT_KV_WARM_TOKENS") {
+                if let Ok(n) = v.parse::<usize>() { cfg.warm_cap = n.min(max_seq); }
+            }
+            if let Ok(v) = std::env::var("REINSTINCT_KV_COLD_TOKENS") {
+                if let Ok(n) = v.parse::<usize>() {
+                    cfg.cold_cap = n.min(max_seq.saturating_sub(cfg.warm_cap));
+                }
+            }
+            eprintln!("[KV] SuperQuant: warm_cap={} cold_cap={} (total {})",
+                cfg.warm_cap, cfg.cold_cap, cfg.total());
+            Gemma4GpuState::new_with_superquant(&model, max_seq, &cache, cfg)
+                .map_err(anyhow::Error::msg)?
+        } else {
+            Gemma4GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?
+        };
+
+        // REINSTINCT_PREFILL: batched-prefill benchmark — run the prefill,
+        // print timing + top-10, and exit (skips generation).
+        if std::env::var_os("REINSTINCT_PREFILL").is_some() {
+            let do_twice = std::env::var_os("REINSTINCT_PREFILL_TWICE").is_some()
+                && prompt.len() > 1;
+            let do_thrice = std::env::var_os("REINSTINCT_PREFILL_THRICE").is_some()
+                && prompt.len() > 1;
+            if do_twice || do_thrice {
+                // Pass 1: cold pools → uncaptured (also warms pools).
+                let mut s_warm = Gemma4GpuState::new(&model, max_seq)
+                    .map_err(anyhow::Error::msg)?;
+                let t1 = std::time::Instant::now();
+                let _ = gm.prefill_forward(&prompt, &mut s_warm)
+                    .map_err(anyhow::Error::msg)?;
+                let el1 = t1.elapsed().as_secs_f64();
+                println!("warmup prefill   = {:.1} ms  ({} tokens, {:.2} ms/token)",
+                         el1 * 1e3, prompt.len(), el1 * 1e3 / prompt.len() as f64);
+                if do_thrice {
+                    // Pass 2: pools warm, state.cache miss → capture +
+                    // instantiate + store.
+                    let mut s_cap = Gemma4GpuState::new(&model, max_seq)
+                        .map_err(anyhow::Error::msg)?;
+                    let t2 = std::time::Instant::now();
+                    let _ = gm.prefill_forward(&prompt, &mut s_cap)
+                        .map_err(anyhow::Error::msg)?;
+                    let el2 = t2.elapsed().as_secs_f64();
+                    println!("captured prefill = {:.1} ms  ({} tokens, {:.2} ms/token)",
+                             el2 * 1e3, prompt.len(), el2 * 1e3 / prompt.len() as f64);
+                    // Pass 3: SAME state.cache hit → just launch cached
+                    // GraphExec, no capture/instantiate cost.
+                    let t3 = std::time::Instant::now();
+                    let _ = gm.prefill_forward(&prompt, &mut s_cap)
+                        .map_err(anyhow::Error::msg)?;
+                    let el3 = t3.elapsed().as_secs_f64();
+                    println!("replay prefill   = {:.1} ms  ({} tokens, {:.2} ms/token)",
+                             el3 * 1e3, prompt.len(), el3 * 1e3 / prompt.len() as f64);
+                }
+            }
+            let t = std::time::Instant::now();
+            let lg = gm.prefill_forward(&prompt, &mut state)
+                .map_err(anyhow::Error::msg)?;
+            let el = t.elapsed().as_secs_f64();
+            let label = if do_thrice { "fresh prefill   " }
+                        else if do_twice { "captured prefill" }
+                        else { "batched prefill " };
+            println!("{label} = {:.1} ms  ({} tokens, {:.2} ms/token)",
+                     el * 1e3, prompt.len(), el * 1e3 / prompt.len() as f64);
+            let mut idx: Vec<usize> = (0..lg.len()).collect();
+            idx.sort_unstable_by(|&a, &b| lg[b].partial_cmp(&lg[a]).unwrap());
+            for &t in idx.iter().take(10) {
+                println!("  token {t:>8}  logit {:>9.4}", lg[t]);
+            }
+            return Ok(());
+        }
+
+        // Capture the decode forward once into a parametric HIP graph —
+        // decode then replays it with a single submission per token.
+        // REINSTINCT_MOE_PROFILE needs the per-kernel path (its per-stage
+        // timer syncs the stream, which a captured graph can't contain).
+        // SuperQuant also blocks graph capture (warm-cascade D2D memcpys).
+        let use_graph = std::env::var_os("REINSTINCT_NO_GRAPH").is_none()
+                     && std::env::var_os("REINSTINCT_MOE_PROFILE").is_none()
+                     && !state.is_superquant();
+        let t_cap = std::time::Instant::now();
+        let graph = if use_graph {
+            let g = gm.capture_forward_graph(&state).map_err(anyhow::Error::msg)?;
+            println!("graph capture = {:.2} s", t_cap.elapsed().as_secs_f32());
+            Some(g)
+        } else {
+            println!("backend mode  = per-kernel");
+            None
+        };
+        let fwd = |gm: &GpuGemma4, t: u32, st: &mut Gemma4GpuState| {
+            match &graph {
+                Some(g) => gm.forward_via_graph(g, t, st),
+                None    => gm.forward_token(t, st),
+            }
+        };
+        // Prefill the prompt in one batched pass — this populates every
+        // layer's KV cache, so decode continues straight from position P.
+        let t_prefill = std::time::Instant::now();
+        let mut lg = gm.prefill_forward(&prompt, &mut state).map_err(anyhow::Error::msg)?;
+        let pf = t_prefill.elapsed().as_secs_f64();
+        println!("prefill      = {:.1} ms ({} tokens, {:.2} ms/token)",
+                 pf * 1e3, prompt.len(), pf * 1e3 / prompt.len() as f64);
+        // SuperQuant: prefill went through the int8 cache (existing
+        // batched kernels). Migrate the populated int8 contents into
+        // the SuperQuant tiers so the decode-time attention reads from
+        // the right place. Decode-step writes thereafter route to
+        // SuperQuant by the block_forward branch.
+        if state.is_superquant() {
+            let t_mig = std::time::Instant::now();
+            state.migrate_int8_to_superquant(&cache).map_err(anyhow::Error::msg)?;
+            println!("kv migrate   = {:.1} ms (int8 → SuperQuant, {} positions)",
+                     t_mig.elapsed().as_secs_f64() * 1e3, state.pos);
+        }
+        // Decode timer — generated tokens only.
+        let t_decode = std::time::Instant::now();
+        for _ in 0..steps {
+            let tok = sample_temp_topk(&lg, temperature, top_k, &mut rng);
+            all.push(tok);
+            if tok == cfg_eos { break; }
+            lg = fwd(&gm, tok, &mut state).map_err(anyhow::Error::msg)?;
+        }
+        let n_gen = all.len() - prompt.len();
+        if n_gen > 0 {
+            println!("decode       = {:.1} ms/token ({:.1} tok/s) over {n_gen} forwards",
+                t_decode.elapsed().as_secs_f64() * 1e3 / n_gen as f64,
+                n_gen as f64 / t_decode.elapsed().as_secs_f64());
+        }
+        let prof = gm.moe_prof_report();
+        if !prof.is_empty() {
+            let tot: f64 = prof.iter().map(|(_, t)| t).sum();
+            println!("\n--- MoE decode per-stage ({n_gen} steps, sync-per-lap) ---");
+            for (label, ms) in &prof {
+                println!("  {label:<16} {ms:8.1} ms  {:5.1}%  ({:.3} ms/step)",
+                         100.0 * ms / tot, ms / n_gen.max(1) as f64);
+            }
+            println!("  {:<16} {tot:8.1} ms", "TOTAL");
+        }
+        // One traced forward for a per-block timing breakdown.
+        let probe = *all.last().unwrap();
+        let (tlg, e_ms, blk_ms, o_ms) =
+            gm.forward_token_timed(probe, &mut state).map_err(anyhow::Error::msg)?;
+        let total: f32 = e_ms + blk_ms.iter().sum::<f32>() + o_ms;
+        let model = Gemma4Model::load(g).map_err(anyhow::Error::msg)?;
+        use reinstinct_model::gemma4::AttnKind;
+        let (mut sw, mut swn, mut fl, mut fln) = (0.0f32, 0usize, 0.0f32, 0usize);
+        for (i, &t) in blk_ms.iter().enumerate() {
+            match model.config.attn_kinds[i] {
+                AttnKind::Sliding => { sw += t; swn += 1; }
+                AttnKind::Full    => { fl += t; fln += 1; }
+            }
+        }
+        println!("\n--- GPU per-stage breakdown (hipEvent ms) ---");
+        println!("  total           {total:>8.3} ms");
+        println!("  embed           {e_ms:>8.3} ms");
+        println!("  blocks sliding  {sw:>8.3} ms  ({swn} blocks, {:.3} ms each)",
+                 if swn>0 {sw/swn as f32} else {0.0});
+        println!("  blocks full     {fl:>8.3} ms  ({fln} blocks, {:.3} ms each)",
+                 if fln>0 {fl/fln as f32} else {0.0});
+        println!("  output_proj     {o_ms:>8.3} ms");
+        let _ = tlg;
+        logits = lg;
+    } else {
+        let g_owned = GgufFile::open(path)?;
+        let m = Gemma4CpuModel::load(g_owned).map_err(anyhow::Error::msg)?;
+        let mut state = m.new_state();
+        let mut lg = Vec::new();
+        for &t in &prompt { lg = m.forward_token(t, &mut state).map_err(anyhow::Error::msg)?; }
+        for _ in 0..steps {
+            let tok = sample_temp_topk(&lg, temperature, top_k, &mut rng);
+            all.push(tok);
+            if tok == cfg_eos { break; }
+            lg = m.forward_token(tok, &mut state).map_err(anyhow::Error::msg)?;
+        }
+        logits = lg;
+    }
+
+    let elapsed = t0.elapsed();
+    let new_tokens = all.len() - prompt.len();
+    println!("\ngenerated   = {} tokens in {:.1} s ({:.3} s/token)",
+        new_tokens, elapsed.as_secs_f64(),
+        elapsed.as_secs_f64() / (prompt.len() + new_tokens).max(1) as f64);
+    println!("output ids  = {all:?}");
+    if let Some(t) = &tok {
+        println!("output text = {:?}", t.decode(&all));
+    }
+
+    // Top-K of the final logits for an architecture sanity check.
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+    println!("\n--- top {} logits (final position) ---", top_k.min(10));
+    for &i in idx.iter().take(top_k.min(10)) {
+        println!("  token {i:>7}  logit {:>9.4}", logits[i]);
+    }
+    let (mn, mx) = logits.iter().fold((f32::INFINITY, f32::NEG_INFINITY),
+        |(a, b), &v| (a.min(v), b.max(v)));
+    let nonfinite = logits.iter().filter(|v| !v.is_finite()).count();
+    println!("logit range = [{mn:.3}, {mx:.3}], nonfinite = {nonfinite}");
+    Ok(())
+}
+
+fn gpu_bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow::Result<()> {
+    use reinstinct_hip;
+    use reinstinct_runtime::{KernelCache, qwen35::{GpuQwen35, Qwen35GpuState}};
+    use reinstinct_model::qwen3_5::BlockKind;
+
+    let n = reinstinct_hip::device_count().map_err(anyhow::Error::msg)?;
+    if n == 0 { anyhow::bail!("no HIP device"); }
+    let _dev = reinstinct_hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+
+    let g = GgufFile::open(path)?;
+    // Profiling only needs the config + GPU-resident weights — load the
+    // lightweight typed model, not the f32 oracle (which would OOM the
+    // host on the 27B).
+    let m = Qwen35Model::load(&g)?;
+    let cfg = &m.config;
+    let token = token.unwrap_or(cfg.eos_token_id);
+
+    println!("model = {}", path.display());
+    println!("token = {token}, iterations = {iters}");
+    println!("loading weights to device...");
+    let t0 = std::time::Instant::now();
+    let gpu = GpuQwen35::new(&m, &g, &cache, iters + 4).map_err(anyhow::Error::msg)?;
+    println!("  load took {:.2} s", t0.elapsed().as_secs_f64());
+
+    let mut state = Qwen35GpuState::new(&m, iters + 4).map_err(anyhow::Error::msg)?;
+
+    // Warm up once (compiles + caches paged-in, etc.)
+    let _ = gpu.forward_token(token, &mut state).map_err(anyhow::Error::msg)?;
+    state.reset().map_err(anyhow::Error::msg)?;
+
+    let mut times_us = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t = std::time::Instant::now();
+        let _ = gpu.forward_token(token, &mut state).map_err(anyhow::Error::msg)?;
+        times_us.push(t.elapsed().as_micros() as u64);
+        state.reset().map_err(anyhow::Error::msg)?;
+    }
+    times_us.sort_unstable();
+    let median  = times_us[times_us.len() / 2] as f64 / 1000.0;
+    let mean    = times_us.iter().sum::<u64>() as f64 / times_us.len() as f64 / 1000.0;
+    let min     = times_us[0] as f64 / 1000.0;
+    let max     = *times_us.last().unwrap() as f64 / 1000.0;
+    println!("\n--- GPU forward_token (direct), {iters} iterations ---");
+    println!("  median  {median:>8.3} ms  ({:>5.1} tok/s)", 1000.0 / median);
+    println!("  mean    {mean:>8.3} ms");
+    println!("  min     {min:>8.3} ms");
+    println!("  max     {max:>8.3} ms");
+
+    // Per-stage breakdown via HIP events. Run a few traced iterations
+    // and average to smooth out single-shot noise; report the per-stage
+    // and per-block-kind contributions.
+    state.reset().map_err(anyhow::Error::msg)?;
+    let trace_iters = 5usize;
+    let mut sum_embed = 0.0_f32;
+    let mut sum_norm  = 0.0_f32;
+    let mut sum_proj  = 0.0_f32;
+    let mut sum_block = vec![0.0_f32; m.block_kinds.len()];
+    let mut sum_total = 0.0_f32;
+    for _ in 0..trace_iters {
+        let (_logits, t) = gpu.forward_token_traced(token, &mut state).map_err(anyhow::Error::msg)?;
+        sum_embed += t.embed_ms;
+        sum_norm  += t.output_norm_ms;
+        sum_proj  += t.output_proj_ms;
+        for (acc, v) in sum_block.iter_mut().zip(t.block_ms.iter()) { *acc += *v; }
+        sum_total += t.total_ms;
+        state.reset().map_err(anyhow::Error::msg)?;
+    }
+    let n = trace_iters as f32;
+    let total = sum_total / n;
+    let embed = sum_embed / n;
+    let norm  = sum_norm / n;
+    let proj  = sum_proj / n;
+    let mut sum_lin  = 0.0_f32; let mut count_lin  = 0usize;
+    let mut sum_full = 0.0_f32; let mut count_full = 0usize;
+    for (acc, &kind) in sum_block.iter().zip(m.block_kinds.iter()) {
+        let avg = acc / n;
+        match kind {
+            BlockKind::LinearAttention => { sum_lin += avg; count_lin += 1; }
+            BlockKind::FullAttention   => { sum_full += avg; count_full += 1; }
+            BlockKind::NextN           => {} // MTP head, not run in main forward
+        }
+    }
+    let pct = |x: f32| 100.0 * x / total;
+    println!("\n--- per-stage GPU breakdown ({} traced iters, hipEvent ms) ---", trace_iters);
+    println!("  total           {total:>8.3} ms  (event sum)");
+    println!("  embed           {embed:>8.3} ms ({:>4.1}%)", pct(embed));
+    println!("  blocks (linear) {sum_lin:>8.3} ms ({:>4.1}%)  -- {count_lin} blocks, {:.3} ms each",
+        pct(sum_lin), if count_lin > 0 { sum_lin / count_lin as f32 } else { 0.0 });
+    println!("  blocks (full)   {sum_full:>8.3} ms ({:>4.1}%)  -- {count_full} blocks, {:.3} ms each",
+        pct(sum_full), if count_full > 0 { sum_full / count_full as f32 } else { 0.0 });
+    println!("  output_norm     {norm:>8.3} ms ({:>4.1}%)", pct(norm));
+    println!("  output_proj     {proj:>8.3} ms ({:>4.1}%)", pct(proj));
+
+    // Per-kernel breakdown for one GDN block (block 0). Pick an L block.
+    let lin_idx = m.block_kinds.iter()
+        .position(|k| matches!(k, BlockKind::LinearAttention))
+        .ok_or_else(|| anyhow::anyhow!("no L block"))?;
+    state.reset().map_err(anyhow::Error::msg)?;
+    let trace_iters_gdn = 5usize;
+    let mut sum_kernels: std::collections::BTreeMap<&'static str, f32> =
+        std::collections::BTreeMap::new();
+    let mut order: Vec<&'static str> = Vec::new();
+    for it in 0..trace_iters_gdn {
+        let (_logits, ks) = gpu.forward_token_traced_gdn(token, &mut state, lin_idx)
+            .map_err(anyhow::Error::msg)?;
+        if it == 0 { for (n, _) in &ks { order.push(n); } }
+        for (n, ms) in ks { *sum_kernels.entry(n).or_insert(0.0) += ms; }
+        state.reset().map_err(anyhow::Error::msg)?;
+    }
+    let total_gdn: f32 = sum_kernels.values().sum::<f32>() / trace_iters_gdn as f32;
+    println!("\n--- one GDN block kernel breakdown ({} iters, ms each) ---", trace_iters_gdn);
+    println!("  block index = {lin_idx} (L)");
+    for n in &order {
+        let avg = sum_kernels[n] / trace_iters_gdn as f32;
+        println!("  {n:<22} {avg:>7.4} ms ({:>4.1}%)", 100.0 * avg / total_gdn);
+    }
+    println!("  {:<22} {total_gdn:>7.4} ms (sum of GDN kernels in one block)", "TOTAL");
+
+    // HIP graph capture: capture the full forward chain once at pos=0
+    // for this token, then time hipGraphLaunch + sync + D2H per call.
+    // The bench resets state between iters so capturing at pos=0 is
+    // valid for every iteration here.
+    state.reset().map_err(anyhow::Error::msg)?;
+    let t_cap = std::time::Instant::now();
+    let exec = gpu.capture_forward_graph(&mut state).map_err(anyhow::Error::msg)?;
+    println!("\nHIP graph capture + instantiate took {:.3} ms",
+        t_cap.elapsed().as_secs_f64() * 1000.0);
+    state.reset().map_err(anyhow::Error::msg)?;
+    let _ = gpu.forward_token_via_graph(&exec, token, &mut state).map_err(anyhow::Error::msg)?;  // warmup
+    state.reset().map_err(anyhow::Error::msg)?;
+
+    let mut g_times_us = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t = std::time::Instant::now();
+        let _ = gpu.forward_token_via_graph(&exec, token, &mut state).map_err(anyhow::Error::msg)?;
+        g_times_us.push(t.elapsed().as_micros() as u64);
+        state.reset().map_err(anyhow::Error::msg)?;
+    }
+    g_times_us.sort_unstable();
+    let g_median = g_times_us[g_times_us.len() / 2] as f64 / 1000.0;
+    let g_mean   = g_times_us.iter().sum::<u64>() as f64 / g_times_us.len() as f64 / 1000.0;
+    let g_min    = g_times_us[0] as f64 / 1000.0;
+    let g_max    = *g_times_us.last().unwrap() as f64 / 1000.0;
+    println!("\n--- GPU forward_token (HIP graph), {iters} iterations ---");
+    println!("  median  {g_median:>8.3} ms  ({:>5.1} tok/s)", 1000.0 / g_median);
+    println!("  mean    {g_mean:>8.3} ms");
+    println!("  min     {g_min:>8.3} ms");
+    println!("  max     {g_max:>8.3} ms");
+    let graph_speedup = median / g_median;
+    let label = if graph_speedup >= 1.0 { "speedup over direct" } else { "slowdown vs direct" };
+    println!("  graph: {graph_speedup:.2}× {label}");
+
+    // CPU baseline — only when the f32 oracle fits in host RAM. The
+    // f32 model is ≈7× the GGUF file; skip it for large models so the
+    // GPU profile still runs (the 27B f32 oracle would be ~115 GB).
+    let gguf_bytes = std::fs::metadata(path).map(|md| md.len()).unwrap_or(0);
+    if gguf_bytes < 4 * 1024 * 1024 * 1024 {
+        println!("\n--- CPU forward_token, {iters} iterations ---");
+        let cpu_m = Qwen35F32Model::load(&g)?;
+        let mut cpu_state = cpu_m.new_state(iters + 4);
+        let _ = cpu_m.forward_token(token, &mut cpu_state);  // warmup
+        cpu_state.reset();
+        let mut cpu_times_us = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t = std::time::Instant::now();
+            let _ = cpu_m.forward_token(token, &mut cpu_state);
+            cpu_times_us.push(t.elapsed().as_micros() as u64);
+            cpu_state.reset();
+        }
+        cpu_times_us.sort_unstable();
+        let cpu_median = cpu_times_us[cpu_times_us.len() / 2] as f64 / 1000.0;
+        println!("  median  {cpu_median:>8.3} ms  ({:>5.1} tok/s)", 1000.0 / cpu_median);
+        let speedup = cpu_median / median;
+        let label = if speedup >= 1.0 { "speedup" } else { "slowdown" };
+        println!("\nGPU vs CPU: {speedup:.2}× {label} (median)");
+    } else {
+        println!("\n(CPU baseline skipped — f32 oracle too large for host RAM)");
+    }
+    Ok(())
+}
+
+fn hip_info(mb: usize, iters: usize) -> anyhow::Result<()> {
+    use reinstinct_hip;
+    let n = reinstinct_hip::device_count().map_err(anyhow::Error::msg)?;
+    println!("HIP devices = {n}");
+    if n == 0 { return Ok(()); }
+
+    for d in 0..n {
+        let name  = reinstinct_hip::device_name(d).map_err(anyhow::Error::msg)?;
+        let total = reinstinct_hip::device_total_mem(d).map_err(anyhow::Error::msg)?;
+        println!("  [{d}] {name}  total VRAM = {:.2} GB", total as f64 / (1u64 << 30) as f64);
+    }
+
+    let _dev = reinstinct_hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let (free, total) = reinstinct_hip::mem_info().map_err(anyhow::Error::msg)?;
+    println!("\ndevice 0: {:.2} / {:.2} GB free",
+        free as f64 / (1u64 << 30) as f64, total as f64 / (1u64 << 30) as f64);
+
+    let n_elems = (mb * (1 << 20)) / std::mem::size_of::<f32>();
+    let host: Vec<f32> = (0..n_elems).map(|i| (i as f32) * 1.0e-3).collect();
+    let mut back = vec![0.0f32; n_elems];
+    println!("\nbandwidth probe: {} MB per direction, {} iters", mb, iters);
+
+    let buf = reinstinct_hip::DeviceBuf::from_slice(&host).map_err(anyhow::Error::msg)?;
+    // Verify correctness on first round.
+    buf.copy_to_host(&mut back).map_err(anyhow::Error::msg)?;
+    for i in 0..n_elems {
+        if host[i].to_bits() != back[i].to_bits() {
+            anyhow::bail!("round-trip mismatch at {i}");
+        }
+    }
+
+    let bytes = (mb << 20) as f64;
+    let mut h2d_total = 0.0_f64;
+    let mut d2h_total = 0.0_f64;
+    for _ in 0..iters {
+        let t0 = std::time::Instant::now();
+        buf.copy_from_host(&host).map_err(anyhow::Error::msg)?;
+        h2d_total += t0.elapsed().as_secs_f64();
+        let t1 = std::time::Instant::now();
+        buf.copy_to_host(&mut back).map_err(anyhow::Error::msg)?;
+        d2h_total += t1.elapsed().as_secs_f64();
+    }
+    let h2d = bytes / (h2d_total / iters as f64) / 1e9;
+    let d2h = bytes / (d2h_total / iters as f64) / 1e9;
+    println!("  H2D  {h2d:>6.2} GB/s   ({:.3} ms / copy)", 1000.0 * h2d_total / iters as f64);
+    println!("  D2H  {d2h:>6.2} GB/s   ({:.3} ms / copy)", 1000.0 * d2h_total / iters as f64);
+
+    // D2D streaming bandwidth: an in-VRAM copy moves `bytes` read + `bytes`
+    // written, so effective HBM traffic per copy is 2*bytes. This is the
+    // achievable streaming-bandwidth ceiling to compare matvec GB/s against.
+    let dst: reinstinct_hip::DeviceBuf<f32> = reinstinct_hip::DeviceBuf::new(n_elems).map_err(anyhow::Error::msg)?;
+    dst.copy_from_device_at(&buf, 0).map_err(anyhow::Error::msg)?; // warm up
+    _dev.synchronize().map_err(anyhow::Error::msg)?;
+    let mut d2d_total = 0.0_f64;
+    for _ in 0..iters {
+        let t = std::time::Instant::now();
+        dst.copy_from_device_at(&buf, 0).map_err(anyhow::Error::msg)?;
+        _dev.synchronize().map_err(anyhow::Error::msg)?;
+        d2d_total += t.elapsed().as_secs_f64();
+    }
+    let d2d = 2.0 * bytes / (d2d_total / iters as f64) / 1e9;
+    println!("  D2D  {d2d:>6.2} GB/s   ({:.3} ms / copy, read+write traffic)",
+        1000.0 * d2d_total / iters as f64);
+
+    // Compute-kernel streaming read: the bandwidth a *compute kernel* (not
+    // the DMA copy engine) sustains on a perfectly-coalesced contiguous
+    // float4 read. This is the honest ceiling a matvec kernel can target.
+    const STREAM_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+extern "C" __global__
+void stream_read(const float4* __restrict__ in, float* __restrict__ out,
+                 unsigned int n4) {
+    unsigned int tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int stride = gridDim.x * blockDim.x;
+    float sx = 0.f, sy = 0.f, sz = 0.f, sw = 0.f;
+    for (unsigned int i = tid; i < n4; i += stride) {
+        float4 v = in[i];
+        sx += v.x; sy += v.y; sz += v.z; sw += v.w;
+    }
+    out[tid] = sx + sy + sz + sw;
+}
+"#;
+    let cache = reinstinct_runtime::KernelCache::new().map_err(anyhow::Error::msg)?;
+    let hsaco = cache.compile("stream_read", STREAM_SRC).map_err(anyhow::Error::msg)?;
+    let module = reinstinct_hip::Module::load(&hsaco).map_err(anyhow::Error::msg)?;
+    let f = module.function("stream_read").map_err(anyhow::Error::msg)?;
+    let stream = reinstinct_hip::Stream::new().map_err(anyhow::Error::msg)?;
+    let (grid, block) = (480u32, 256u32);
+    let sink: reinstinct_hip::DeviceBuf<f32> = reinstinct_hip::DeviceBuf::new((grid * block) as usize)
+        .map_err(anyhow::Error::msg)?;
+    let n4 = (n_elems / 4) as u32;
+    let launch = |st: &reinstinct_hip::Stream| -> Result<(), String> {
+        let mut ia = buf.raw_ptr();
+        let mut oa = sink.raw_ptr();
+        let mut na = n4;
+        let mut args: [*mut std::ffi::c_void; 3] = [
+            &mut ia as *mut _ as *mut std::ffi::c_void, &mut oa as *mut _ as *mut std::ffi::c_void,
+            &mut na as *mut _ as *mut std::ffi::c_void];
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(st), &mut args) }
+    };
+    launch(&stream).map_err(anyhow::Error::msg)?; // warm up
+    _dev.synchronize().map_err(anyhow::Error::msg)?;
+    let start = reinstinct_hip::Event::new().map_err(anyhow::Error::msg)?;
+    let stop  = reinstinct_hip::Event::new().map_err(anyhow::Error::msg)?;
+    start.record(&stream).map_err(anyhow::Error::msg)?;
+    for _ in 0..iters { launch(&stream).map_err(anyhow::Error::msg)?; }
+    stop.record(&stream).map_err(anyhow::Error::msg)?;
+    _dev.synchronize().map_err(anyhow::Error::msg)?;
+    let ms = reinstinct_hip::Event::elapsed_time(&start, &stop).map_err(anyhow::Error::msg)? as f64;
+    let read = bytes / (ms / 1000.0 / iters as f64) / 1e9;
+    println!("  kernel-read  {read:>6.2} GB/s   ({:.3} ms / pass, compute-kernel ceiling)",
+        ms / iters as f64);
+
+    // Per-kernel dispatch cost — the fixed overhead of a kernel that does
+    // ~no work, measured both as a HIP-graph replay (the path decode
+    // uses: CPU dispatch amortised, leaves GPU-side per-dispatch cost)
+    // and as direct launches (adds CPU dispatch). Multiply by the kernel
+    // count to size what kernel fusion can recover.
+    const NOOP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+extern "C" __global__ void noop_kernel(int* p) {
+    if (threadIdx.x == 0) p[0] += 1;
+}
+"#;
+    let nmod = reinstinct_hip::Module::load(&cache.compile("noop_kernel", NOOP_SRC).map_err(anyhow::Error::msg)?)
+        .map_err(anyhow::Error::msg)?;
+    let nf = nmod.function("noop_kernel").map_err(anyhow::Error::msg)?;
+    let nbuf: reinstinct_hip::DeviceBuf<i32> = reinstinct_hip::DeviceBuf::new(1).map_err(anyhow::Error::msg)?;
+    let n_kern = 1024usize;
+    let noop = |st: &reinstinct_hip::Stream| -> Result<(), String> {
+        let mut p = nbuf.raw_ptr();
+        let mut a: [*mut std::ffi::c_void; 1] = [&mut p as *mut _ as *mut std::ffi::c_void];
+        unsafe { nf.launch((1, 1, 1), (64, 1, 1), 0, Some(st), &mut a) }
+    };
+
+    // Graph replay: capture n_kern noop launches, replay `iters` times.
+    use reinstinct_hip::sys::HipStreamCaptureMode;
+    reinstinct_hip::Graph::begin_capture(&stream, HipStreamCaptureMode::Global).map_err(anyhow::Error::msg)?;
+    for _ in 0..n_kern { noop(&stream).map_err(anyhow::Error::msg)?; }
+    let g = reinstinct_hip::Graph::end_capture(&stream).map_err(anyhow::Error::msg)?;
+    let gexec = g.instantiate().map_err(anyhow::Error::msg)?;
+    gexec.launch(&stream).map_err(anyhow::Error::msg)?;        // warm up
+    _dev.synchronize().map_err(anyhow::Error::msg)?;
+    let gs = reinstinct_hip::Event::new().map_err(anyhow::Error::msg)?;
+    let ge = reinstinct_hip::Event::new().map_err(anyhow::Error::msg)?;
+    gs.record(&stream).map_err(anyhow::Error::msg)?;
+    for _ in 0..iters { gexec.launch(&stream).map_err(anyhow::Error::msg)?; }
+    ge.record(&stream).map_err(anyhow::Error::msg)?;
+    _dev.synchronize().map_err(anyhow::Error::msg)?;
+    let g_ms = reinstinct_hip::Event::elapsed_time(&gs, &ge).map_err(anyhow::Error::msg)? as f64;
+    let g_per = g_ms * 1000.0 / (iters as f64 * n_kern as f64);   // µs / kernel
+
+    // Direct launches: n_kern * iters, wall-clock timed.
+    noop(&stream).map_err(anyhow::Error::msg)?;
+    _dev.synchronize().map_err(anyhow::Error::msg)?;
+    let t = std::time::Instant::now();
+    for _ in 0..iters { for _ in 0..n_kern { noop(&stream).map_err(anyhow::Error::msg)?; } }
+    _dev.synchronize().map_err(anyhow::Error::msg)?;
+    let d_per = t.elapsed().as_secs_f64() * 1e6 / (iters as f64 * n_kern as f64);
+
+    println!("\nper-kernel dispatch cost ({} kernels, {} iters):", n_kern, iters);
+    println!("  graph replay  {g_per:.3} µs / kernel   (GPU-side dispatch)");
+    println!("  direct launch {d_per:.3} µs / kernel   (+ CPU dispatch)");
+    println!("  → 1260 kernels/token ≈ {:.2} ms graph-side", g_per * 1260.0 / 1000.0);
+    Ok(())
+}
+
+fn bench(path: &std::path::Path, iters: usize, token: Option<u32>) -> anyhow::Result<()> {
+    let g = GgufFile::open(path)?;
+    let m = Qwen35F32Model::load(&g)?;
+    let cfg = &m.model.config;
+    let token = token.unwrap_or(cfg.eos_token_id);
+    println!("model = {}", path.display());
+    println!("token = {token}, iterations = {iters}");
+
+    // Warm up once so loader / page cache effects don't dominate iter[0].
+    let mut state = m.new_state(iters + 4);
+    let _ = m.forward_token(token, &mut state);
+
+    let mut traces: Vec<ForwardTrace> = Vec::with_capacity(iters);
+    state.reset();
+    for _ in 0..iters {
+        let mut t = ForwardTrace::default();
+        let _ = m.forward_token_traced(token, &mut state, Some(&mut t));
+        traces.push(t);
+        state.reset();
+    }
+
+    // Aggregate.
+    let n_blocks = m.model.block_kinds.len();
+    let mut sum_embed = 0u64;
+    let mut sum_norm = 0u64;
+    let mut sum_proj = 0u64;
+    let mut sum_blocks_lin = 0u64;  // total ns over all linear-attn blocks
+    let mut sum_blocks_full = 0u64;
+    let mut count_lin = 0usize;
+    let mut count_full = 0usize;
+    let mut sum_per_block = vec![0u64; n_blocks];
+    for t in &traces {
+        sum_embed += t.embed_ns;
+        sum_norm += t.output_norm_ns;
+        sum_proj += t.output_proj_ns;
+        for (i, &b) in t.block_ns.iter().enumerate() {
+            sum_per_block[i] += b;
+            match m.model.block_kinds[i] {
+                BlockKind::LinearAttention => { sum_blocks_lin += b; count_lin += 1; }
+                BlockKind::FullAttention   => { sum_blocks_full += b; count_full += 1; }
+                BlockKind::NextN           => {} // MTP head, not run in main forward
+            }
+        }
+    }
+    let n = iters as u64;
+    let total: u64 = traces.iter().map(|t| t.total_ns()).sum();
+    let avg = total / n;
+    let pct = |x: u64| 100.0 * (x as f64) / (total as f64);
+
+    println!("\n--- per-iteration averages ---");
+    println!("  total           {:>9.3} ms", (avg as f64) / 1.0e6);
+    println!("  embed lookup    {:>9.3} ms ({:>4.1}%)",
+        (sum_embed / n) as f64 / 1.0e6, pct(sum_embed));
+    println!("  blocks (linear) {:>9.3} ms ({:>4.1}%)  -- {} blocks, {:.3} ms each",
+        (sum_blocks_lin / n) as f64 / 1.0e6, pct(sum_blocks_lin),
+        count_lin / iters,
+        if count_lin > 0 { (sum_blocks_lin as f64) / (count_lin as f64) / 1.0e6 } else { 0.0 });
+    println!("  blocks (full)   {:>9.3} ms ({:>4.1}%)  -- {} blocks, {:.3} ms each",
+        (sum_blocks_full / n) as f64 / 1.0e6, pct(sum_blocks_full),
+        count_full / iters,
+        if count_full > 0 { (sum_blocks_full as f64) / (count_full as f64) / 1.0e6 } else { 0.0 });
+    println!("  output_norm     {:>9.3} ms ({:>4.1}%)",
+        (sum_norm / n) as f64 / 1.0e6, pct(sum_norm));
+    println!("  output_proj     {:>9.3} ms ({:>4.1}%)",
+        (sum_proj / n) as f64 / 1.0e6, pct(sum_proj));
+
+    println!("\n--- per-block averages (ms) ---");
+    for (i, &s) in sum_per_block.iter().enumerate() {
+        let kind = match m.model.block_kinds[i] {
+            BlockKind::LinearAttention => "L",
+            BlockKind::FullAttention   => "F",
+            BlockKind::NextN           => "N",  // shouldn't appear in main block_kinds
+        };
+        println!("  block {i:>2} {kind}  {:>7.3}", (s / n) as f64 / 1.0e6);
+    }
+    Ok(())
+}
+
+fn debug_embed(path: &std::path::Path, tokens: &[u32]) -> anyhow::Result<()> {
+    let g = GgufFile::open(path)?;
+    let m = Qwen35F32Model::load(&g)?;
+    let h = m.model.config.hidden_size as usize;
+    println!("hidden_size = {h}, vocab = {}", m.model.config.vocab_size);
+    for &tok in tokens {
+        let off = tok as usize * h;
+        let row = &m.weights.token_embd[off..off + h];
+        let rms: f32 = (row.iter().map(|v| v * v).sum::<f32>() / h as f32).sqrt();
+        let max = row.iter().fold(0.0_f32, |a, &b| a.max(b.abs()));
+        let head: Vec<f32> = row[..6].to_vec();
+        let tail: Vec<f32> = row[h - 6..].to_vec();
+        println!("\ntoken {tok:>6}:");
+        println!("  rms        = {rms:.6}");
+        println!("  max|x|     = {max:.6}");
+        println!("  first 6    = {head:?}");
+        println!("  last 6     = {tail:?}");
+    }
+    Ok(())
+}
+
+fn generate(path: &std::path::Path, token: Option<u32>, tokens: Option<Vec<u32>>, k: usize, gpu: bool) -> anyhow::Result<()> {
+    let g = GgufFile::open(path)?;
+    let m = Qwen35F32Model::load(&g)?;
+    let cfg = &m.model.config;
+    let prompt: Vec<u32> = tokens.unwrap_or_else(|| vec![token.unwrap_or(cfg.eos_token_id)]);
+    println!("model         = {}", path.display());
+    println!("vocab         = {}", cfg.vocab_size);
+    println!("backend       = {}", if gpu { "GPU (HIP)" } else { "CPU" });
+    println!("input tokens  = {prompt:?}");
+
+    let logits: Vec<f32> = if gpu {
+        use reinstinct_hip;
+        use reinstinct_runtime::{KernelCache, qwen35::{GpuQwen35, Qwen35GpuState}};
+        let n = reinstinct_hip::device_count().map_err(anyhow::Error::msg)?;
+        if n == 0 { anyhow::bail!("no HIP device"); }
+        let _dev = reinstinct_hip::Device::set(0).map_err(anyhow::Error::msg)?;
+        let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+        let max_seq = prompt.len() + 8;
+        let t_load = std::time::Instant::now();
+        let gpu = GpuQwen35::new(&m.model, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
+        println!("weights load  = {:.2} s", t_load.elapsed().as_secs_f32());
+        let mut state = Qwen35GpuState::new(&m.model,max_seq).map_err(anyhow::Error::msg)?;
+        let t0 = std::time::Instant::now();
+        let l = gpu.forward_tokens(&prompt, &mut state).map_err(anyhow::Error::msg)?;
+        println!("forward took  = {:.3} s ({} tokens, {:.1} ms/token)",
+            t0.elapsed().as_secs_f32(), prompt.len(),
+            t0.elapsed().as_secs_f64() * 1000.0 / prompt.len() as f64);
+        l
+    } else {
+        let mut state = m.new_state(prompt.len() + 8);
+        let t0 = std::time::Instant::now();
+        let l = m.forward_tokens(&prompt, &mut state);
+        println!("forward took  = {:.3} s ({} tokens, {:.1} ms/token)",
+            t0.elapsed().as_secs_f32(), prompt.len(),
+            t0.elapsed().as_secs_f64() * 1000.0 / prompt.len() as f64);
+        l
+    };
+
+    // Compute softmax probability for the top-k for context.
+    let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let max_logit = indexed[0].1;
+    let mut sum_exp = 0.0_f64;
+    for &(_, v) in &logits.iter().enumerate().map(|(i, x)| (i, *x)).collect::<Vec<_>>() {
+        sum_exp += ((v - max_logit) as f64).exp();
+    }
+
+    println!("\n--- top {k} logits ---");
+    for &(i, v) in indexed.iter().take(k) {
+        let p = ((v - max_logit) as f64).exp() / sum_exp;
+        println!("  token {i:>6}  logit {v:>9.4}  p = {p:.4}");
+    }
+
+    let (mut min, mut max) = (f32::INFINITY, f32::NEG_INFINITY);
+    let mut sum = 0.0_f64;
+    let mut sum_sq = 0.0_f64;
+    for &v in &logits {
+        if v < min { min = v; }
+        if v > max { max = v; }
+        sum += v as f64;
+        sum_sq += (v as f64) * (v as f64);
+    }
+    let n = logits.len() as f64;
+    let mean = (sum / n) as f32;
+    let std = ((sum_sq / n) - (mean as f64).powi(2)).sqrt() as f32;
+    println!("\nlogit stats   = min {min:.4}  max {max:.4}  mean {mean:.4}  std {std:.4}");
+    Ok(())
+}
+
+/// QMTP-1 diagnostic — prefill a prompt on a Qwen MTP model, then probe
+/// the in-GGUF "nextn" head's K=1 spec-decode accept rate.
+fn qwen_mtp_probe_cli(path: &std::path::Path, prompt: Option<String>,
+                      steps: usize) -> anyhow::Result<()> {
+    use reinstinct_hip;
+    use reinstinct_tokenizer::Tokenizer;
+    use reinstinct_sampling::argmax;
+    use reinstinct_runtime::{KernelCache, qwen35::{GpuQwen35, Qwen35GpuState}};
+
+    let g = GgufFile::open(path)?;
+    let arch = g.metadata_get("general.architecture")
+        .and_then(|v| v.as_str()).unwrap_or("<unknown>");
+    if !matches!(arch, "qwen35" | "qwen35moe") {
+        anyhow::bail!("qwen-mtp-probe is qwen-only (this is {arch})");
+    }
+    let model = Qwen35Model::load(&g)?;
+
+    let tok = Tokenizer::from_gguf(&g).map_err(anyhow::Error::msg)?;
+    let prompt_ids: Vec<u32> = match &prompt {
+        Some(text) => {
+            let ids = tok.encode(text);
+            if ids.is_empty() { anyhow::bail!("prompt encoded to zero tokens"); }
+            ids
+        }
+        None => vec![model.config.eos_token_id],
+    };
+
+    if reinstinct_hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+    let _dev = reinstinct_hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+    let max_seq = prompt_ids.len() + steps + 4;
+    let gpu = GpuQwen35::new(&model, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
+    if gpu.n_mtp_heads() == 0 {
+        anyhow::bail!("model has no MTP (nextn) head — not an MTP build");
+    }
+    let mut state = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+
+    println!("model   = {}", path.display());
+    println!("arch    = {arch}");
+    println!("prompt  = {} tokens", prompt_ids.len());
+    println!("steps   = {steps}");
+
+    let logits = if prompt_ids.len() > 1 {
+        gpu.forward_tokens_batched(&prompt_ids, &mut state).map_err(anyhow::Error::msg)?
+    } else {
+        gpu.forward_tokens(&prompt_ids, &mut state).map_err(anyhow::Error::msg)?
+    };
+    let first = argmax(&logits);
+
+    let t0 = std::time::Instant::now();
+    let (rate, matches, total) = gpu.mtp_accept_probe(first, steps, &mut state)
+        .map_err(anyhow::Error::msg)?;
+    let el = t0.elapsed().as_secs_f64();
+
+    println!("\n--- MTP K=1 accept probe ---");
+    println!("  matches      = {matches} / {total}");
+    println!("  accept rate  = {:.1}%", rate * 100.0);
+    println!("  elapsed      = {:.2} s  ({:.1} tok/s main decode)",
+             el, total as f64 / el);
+    println!("\nNOTE: the MTP block's KV cache is built cold (it does not");
+    println!("mirror the prefill), so early steps under-report — QMTP-2");
+    println!("warms it. A healthy drafter should still clear ~50%+ here.");
+    Ok(())
+}
+
+/// QMTP-2 check — confirm the batched K-token verify forward agrees
+/// with sequential single-token decode (same per-position argmax).
+fn qwen_verify_check_cli(path: &std::path::Path, prompt: Option<String>,
+                         k: usize) -> anyhow::Result<()> {
+    use reinstinct_hip;
+    use reinstinct_tokenizer::Tokenizer;
+    use reinstinct_sampling::argmax;
+    use reinstinct_runtime::{KernelCache, qwen35::{GpuQwen35, Qwen35GpuState}};
+
+    let g = GgufFile::open(path)?;
+    let arch = g.metadata_get("general.architecture")
+        .and_then(|v| v.as_str()).unwrap_or("<unknown>");
+    if !matches!(arch, "qwen35" | "qwen35moe") {
+        anyhow::bail!("qwen-verify-check is qwen-only (this is {arch})");
+    }
+    let model = Qwen35Model::load(&g)?;
+    let tok = Tokenizer::from_gguf(&g).map_err(anyhow::Error::msg)?;
+    let prompt_ids: Vec<u32> = match &prompt {
+        Some(text) => {
+            let ids = tok.encode(text);
+            if ids.is_empty() { anyhow::bail!("prompt encoded to zero tokens"); }
+            ids
+        }
+        None => vec![model.config.eos_token_id],
+    };
+
+    if reinstinct_hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+    let _dev = reinstinct_hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+    let max_seq = prompt_ids.len() + k + 4;
+    let gpu = GpuQwen35::new(&model, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
+
+    let prefill = |st: &mut Qwen35GpuState| -> anyhow::Result<Vec<f32>> {
+        if prompt_ids.len() > 1 {
+            gpu.forward_tokens_batched(&prompt_ids, st).map_err(anyhow::Error::msg)
+        } else {
+            gpu.forward_tokens(&prompt_ids, st).map_err(anyhow::Error::msg)
+        }
+    };
+
+    println!("model   = {}", path.display());
+    println!("arch    = {arch}");
+    println!("prompt  = {} tokens   k = {k}", prompt_ids.len());
+
+    // Run A — sequential decode, record per-position logits + inputs.
+    let mut state_a = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+    let pre = prefill(&mut state_a)?;
+    let mut inputs: Vec<u32> = vec![argmax(&pre)];
+    let mut seq_logits: Vec<Vec<f32>> = Vec::with_capacity(k);
+    for i in 0..k {
+        let lg = gpu.forward_token(inputs[i], &mut state_a).map_err(anyhow::Error::msg)?;
+        if i + 1 < k { inputs.push(argmax(&lg)); }
+        seq_logits.push(lg);
+    }
+
+    // Run B — batched verify over the same token sequence, fresh state.
+    let mut state_b = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+    let _ = prefill(&mut state_b)?;
+    let verify = gpu.forward_tokens_verify(&inputs, &mut state_b)
+        .map_err(anyhow::Error::msg)?;
+
+    // Compare per position.
+    println!("\n  pos   input    seq_argmax   verify_argmax   max|Δlogit|");
+    let mut all_match = true;
+    let mut worst = 0.0f32;
+    for i in 0..k {
+        let a = argmax(&seq_logits[i]);
+        let b = argmax(&verify[i]);
+        let d = seq_logits[i].iter().zip(&verify[i])
+            .map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        worst = worst.max(d);
+        let mark = if a == b { "" } else { all_match = false; "  <-- MISMATCH" };
+        println!("  {i:>3}   {:>6}   {a:>10}   {b:>13}   {d:>11.4}{mark}", inputs[i]);
+    }
+    println!("\n  argmax {} at every position   worst |Δlogit| = {worst:.4}",
+             if all_match { "MATCHES" } else { "DIFFERS" });
+    if all_match {
+        println!("  QMTP-2 verify forward: PASS");
+    } else {
+        println!("  QMTP-2 verify forward: argmax drift — int8 matvec vs batched");
+        println!("  GEMM precision can flip a close call; inspect the |Δlogit|.");
+    }
+    Ok(())
+}
+
+/// QMTP-3 — generate text with MTP speculative decoding, reporting the
+/// accept rate and decode tok/s against a plain single-token baseline.
+fn qwen_mtp_gen_cli(path: &std::path::Path, prompt: Option<String>,
+                    n_tokens: usize, k: usize) -> anyhow::Result<()> {
+    use reinstinct_hip;
+    use reinstinct_tokenizer::Tokenizer;
+    use reinstinct_sampling::argmax;
+    use reinstinct_runtime::{KernelCache, qwen35::{
+        GpuQwen35, Qwen35GpuState, GpuKvCache, Qwen35Snapshot}};
+
+    let g = GgufFile::open(path)?;
+    let arch = g.metadata_get("general.architecture")
+        .and_then(|v| v.as_str()).unwrap_or("<unknown>");
+    if !matches!(arch, "qwen35" | "qwen35moe") {
+        anyhow::bail!("qwen-mtp-gen is qwen-only (this is {arch})");
+    }
+    let model = Qwen35Model::load(&g)?;
+    let tok = Tokenizer::from_gguf(&g).map_err(anyhow::Error::msg)?;
+    let prompt_ids: Vec<u32> = match &prompt {
+        Some(text) => {
+            let ids = tok.encode(text);
+            if ids.is_empty() { anyhow::bail!("prompt encoded to zero tokens"); }
+            ids
+        }
+        None => vec![model.config.eos_token_id],
+    };
+
+    if reinstinct_hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+    let _dev = reinstinct_hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+    let max_seq = prompt_ids.len() + n_tokens + k + 8;
+    let gpu = GpuQwen35::new(&model, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
+    if gpu.n_mtp_heads() == 0 {
+        anyhow::bail!("model has no MTP (nextn) head — not an MTP build");
+    }
+    let eos = model.config.eos_token_id;
+
+    let prefill = |st: &mut Qwen35GpuState| -> anyhow::Result<Vec<f32>> {
+        if prompt_ids.len() > 1 {
+            gpu.forward_tokens_batched(&prompt_ids, st).map_err(anyhow::Error::msg)
+        } else {
+            gpu.forward_tokens(&prompt_ids, st).map_err(anyhow::Error::msg)
+        }
+    };
+
+    println!("model   = {}", path.display());
+    println!("prompt  = {} tokens   k = {k}   max new = {n_tokens}", prompt_ids.len());
+
+    // --- MTP spec-decode run ---
+    let mut state = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+    let pre = prefill(&mut state)?;
+    let first = argmax(&pre);
+    let mut mtp_kv = GpuKvCache::new(
+        k * n_tokens + 16,
+        model.config.attn_n_kv_heads as usize,
+        model.config.attn_head_dim as usize,
+    ).map_err(anyhow::Error::msg)?;
+    let mut snapshot = Qwen35Snapshot::new(&state).map_err(anyhow::Error::msg)?;
+    let t_spec = std::time::Instant::now();
+    let (out, stats) = gpu.mtp_spec_generate(&mut state, &mut mtp_kv, &mut snapshot,
+        first, eos, n_tokens, k).map_err(anyhow::Error::msg)?;
+    let spec_el = t_spec.elapsed().as_secs_f64();
+
+    // --- plain-decode baseline, same token count ---
+    let mut state_b = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+    let pre_b = prefill(&mut state_b)?;
+    let t_plain = std::time::Instant::now();
+    let mut cur = argmax(&pre_b);
+    for _ in 0..out.len() {
+        let lg = gpu.forward_token(cur, &mut state_b).map_err(anyhow::Error::msg)?;
+        cur = argmax(&lg);
+    }
+    let plain_el = t_plain.elapsed().as_secs_f64();
+
+    let text = tok.decode(&out);
+    println!("\n--- generated ({} tokens) ---\n{text}", out.len());
+    println!("\n--- MTP spec-decode (k={k}) ---");
+    println!("  rounds        = {}", stats.rounds);
+    println!("  drafts        = {} / {} accepted = {:.1}%",
+             stats.accepted, stats.drafted, stats.accept_rate() * 100.0);
+    println!("  tokens/round  = {:.2}",
+             out.len() as f64 / stats.rounds.max(1) as f64);
+    let n = out.len() as f64;
+    let spec_tps  = n / spec_el;
+    let plain_tps = n / plain_el;
+    println!("  spec decode   = {spec_tps:.1} tok/s  ({spec_el:.2} s)");
+    println!("  plain decode  = {plain_tps:.1} tok/s  ({plain_el:.2} s)");
+    println!("  speedup       = {:.2}x", spec_tps / plain_tps);
+    if stats.hit_eos { println!("  (stopped at EOS)"); }
+    Ok(())
+}
+
+/// Multi-turn Gemma 4 chat with KV-cache prefix reuse. Prefills the
+/// system message once, snapshots the state, and reuses that snapshot
+/// for every turn — TTFT for turn N+ is bounded by the per-turn token
+/// count, not the system+history length.
+fn chat_gemma4_cli(path: &std::path::Path, system: Option<String>,
+                   turns: Vec<String>, steps: usize,
+                   temperature: f32, top_k: usize, seed: u64) -> anyhow::Result<()> {
+    use reinstinct_chat::{ChatMessage, Role, format_gemma4, format_gemma4_user_turn};
+    use reinstinct_sampling::{Rng, sample_temp_topk};
+    use reinstinct_tokenizer::GemmaTokenizer;
+    use reinstinct_model::gemma4::Gemma4Model;
+    use reinstinct_runtime::{KernelCache, gemma4::{GpuGemma4, Gemma4GpuState}};
+    use reinstinct_hip;
+
+    if turns.is_empty() {
+        anyhow::bail!("chat: need at least one --turn");
+    }
+    let g = GgufFile::open(path)?;
+    let arch = g.metadata_get("general.architecture").and_then(|v| v.as_str()).unwrap_or("?");
+    if arch != "gemma4" {
+        anyhow::bail!("chat is currently gemma4-only (this is {arch})");
+    }
+    let tok = GemmaTokenizer::from_gguf(&g).map_err(anyhow::Error::msg)?;
+
+    // System prefix — rendered with add_generation_prompt = false so
+    // it ends at <turn|>\n, the natural place to splice each turn in.
+    let mut prefix_msgs: Vec<ChatMessage> = Vec::new();
+    if let Some(s) = &system {
+        prefix_msgs.push(ChatMessage { role: Role::System, content: s.clone() });
+    }
+    let prefix_tokens: Vec<u32> = if prefix_msgs.is_empty() {
+        vec![tok.bos_id]
+    } else {
+        format_gemma4(&tok, &prefix_msgs, false).map_err(anyhow::Error::msg)?
+    };
+
+    // Conservative max_seq: prefix + every turn (with its model header
+    // and decoded response) all coresident — `chat` never compacts.
+    let per_turn_cap = 64 + steps + 16;
+    let max_seq = prefix_tokens.len() + turns.len() * per_turn_cap + 32;
+
+    println!("model       = {} (gemma4)", path.display());
+    println!("backend     = GPU (HIP)");
+    println!("system tok  = {} (prefix prefilled + snapshotted once)", prefix_tokens.len());
+    println!("turns       = {}, steps/turn = {steps}", turns.len());
+
+    if reinstinct_hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+    let _dev = reinstinct_hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+    let model = Gemma4Model::load(&g).map_err(anyhow::Error::msg)?;
+    let cfg_eos = model.config.eos_token_id;
+    let gm = GpuGemma4::new(&model, &g, &cache, max_seq).map_err(anyhow::Error::msg)?;
+    let mut state = Gemma4GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+    let exec = gm.capture_forward_graph(&state).map_err(anyhow::Error::msg)?;
+
+    // 1) Batched prefill of the system prefix → snapshot.
+    let t = std::time::Instant::now();
+    state.reset();
+    let _ = gm.prefill_forward(&prefix_tokens, &mut state).map_err(anyhow::Error::msg)?;
+    let t_prefix = t.elapsed().as_secs_f64();
+    let t = std::time::Instant::now();
+    let snap = state.snapshot().map_err(anyhow::Error::msg)?;
+    let t_snap = t.elapsed().as_secs_f64();
+    println!("prefix prefill = {:.1} ms ({} tok, snapshot {:.1} ms)",
+             t_prefix * 1e3, prefix_tokens.len(), t_snap * 1e3);
+
+    let mut rng = Rng::new(seed);
+    for (i, turn_text) in turns.iter().enumerate() {
+        // 2) Restore the cached prefix.
+        let t_r = std::time::Instant::now();
+        state.restore(&snap).map_err(anyhow::Error::msg)?;
+        let t_restore = t_r.elapsed().as_secs_f64();
+        // 3) Sequential prefill of the per-turn tokens (small — typically
+        // tens of tokens; sequential here is simpler than extending
+        // prefill_forward to start at a non-zero position).
+        let turn_tokens = format_gemma4_user_turn(&tok, turn_text).map_err(anyhow::Error::msg)?;
+        let t_t = std::time::Instant::now();
+        let mut logits: Vec<f32> = Vec::new();
+        for &tk in &turn_tokens {
+            logits = gm.forward_via_graph(&exec, tk, &mut state).map_err(anyhow::Error::msg)?;
+        }
+        let t_turn = t_t.elapsed().as_secs_f64();
+        let ttft_ms = (t_restore + t_turn) * 1e3;
+
+        // 4) Decode.
+        let t_d = std::time::Instant::now();
+        let mut out_ids: Vec<u32> = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            let tk = sample_temp_topk(&logits, temperature, top_k, &mut rng);
+            out_ids.push(tk);
+            if tk == cfg_eos { break; }
+            logits = gm.forward_via_graph(&exec, tk, &mut state).map_err(anyhow::Error::msg)?;
+        }
+        let t_decode = t_d.elapsed().as_secs_f64();
+        let dec_tps = out_ids.len() as f64 / t_decode;
+
+        let response = tok.decode(&out_ids);
+        println!();
+        println!("--- turn {} ({} user tok) ---", i + 1, turn_tokens.len());
+        println!("  ttft        = {:.1} ms  (restore {:.1} + prefill {:.1})",
+                 ttft_ms, t_restore * 1e3, t_turn * 1e3);
+        println!("  decode      = {:.1} tok/s over {} tokens", dec_tps, out_ids.len());
+        println!("  user        > {}", turn_text);
+        println!("  assistant   > {}", response.trim());
+    }
+
+    Ok(())
+}
+
+/// Spec-decode smoke test for the Gemma 4 MTP drafter. Loads target +
+/// End-to-end SuperQuant pipeline bench on synthetic K/V tensors.
+/// Allocates the cache, fills via `write_step` (timed), runs the 3-tier
+/// attention kernel (timed), reports per-stage tok/s + the attention
+/// rel-L2 error vs a pure fp32 reference computed from the original
+/// pre-quantization tensors.
+fn superquant_bench_cli(warm_cap: usize, cold_cap: usize,
+                        n_kv: usize, n_heads: usize, head_dim: usize,
+                        n_writes: usize, n_splits: usize) -> anyhow::Result<()>
+{
+    use reinstinct_hip::{self, DeviceBuf};
+    use reinstinct_runtime::{KernelCache,
+        kv_superquant::{SuperQuantKvCache, SuperQuantConfig,
+                        launch_attn_partial_superquant}};
+
+    let n_kv_u  = n_kv;
+    let n_heads_u = n_heads;
+    let groups = n_heads_u / n_kv_u;
+    if n_heads_u % n_kv_u != 0 {
+        anyhow::bail!("n_heads ({n_heads_u}) must be a multiple of n_kv ({n_kv_u})");
+    }
+    if head_dim % 128 != 0 {
+        anyhow::bail!("head_dim ({head_dim}) must be a multiple of 128 for RHT groups");
+    }
+
+    let cfg = SuperQuantConfig { warm_cap, cold_cap };
+    let n_writes_actual = n_writes.min(cfg.total());
+    println!("SuperQuant bench (2-tier: Warm int8 / Cold turbo3):");
+    println!("  tier caps:    warm={warm_cap}  cold={cold_cap}  total={}", cfg.total());
+    println!("  shape:        n_heads={n_heads_u}  n_kv={n_kv_u}  groups={groups}  head_dim={head_dim}");
+    println!("  writes:       {n_writes_actual}  (requested {n_writes})");
+    println!("  n_splits:     {n_splits}");
+
+    let _ = reinstinct_hip::Device::set(0).map_err(|e| anyhow::anyhow!("set gpu: {e}"))?;
+    let cache = KernelCache::new().map_err(|e| anyhow::anyhow!(e))?;
+    let kv = SuperQuantKvCache::new(&cache, n_kv_u, head_dim, cfg)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Synthesize K/V — keep on host so we can compute the fp32 reference
+    // attention at the end.
+    let row_elems = n_kv_u * head_dim;
+    let mut rng_state: u64 = 0x5421_F00D;
+    let mut rng = || {
+        rng_state = rng_state.wrapping_mul(6364136223846793005)
+                              .wrapping_add(1442695040888963407);
+        let bits = ((rng_state >> 33) as u32 & 0x007F_FFFF) | 0x3f80_0000;
+        (f32::from_bits(bits) - 1.5) * 0.4
+    };
+    let mut ref_k: Vec<Vec<f32>> = Vec::with_capacity(n_writes_actual);
+    let mut ref_v: Vec<Vec<f32>> = Vec::with_capacity(n_writes_actual);
+    for _ in 0..n_writes_actual {
+        ref_k.push((0..row_elems).map(|_| rng()).collect());
+        ref_v.push((0..row_elems).map(|_| rng()).collect());
+    }
+    let q: Vec<f32> = (0..n_heads_u * head_dim).map(|_| rng()).collect();
+
+    // Time the write phase.
+    println!("\nphase 1: writes");
+    let t_write = std::time::Instant::now();
+    for (k, v) in ref_k.iter().zip(ref_v.iter()) {
+        let dk = DeviceBuf::<f32>::from_slice(k).map_err(|e| anyhow::anyhow!(e))?;
+        let dv = DeviceBuf::<f32>::from_slice(v).map_err(|e| anyhow::anyhow!(e))?;
+        kv.write_step(&cache, dk.raw_ptr(), dv.raw_ptr())
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+    reinstinct_hip::Device(0).synchronize().map_err(|e| anyhow::anyhow!(e))?;
+    let dt_write = t_write.elapsed();
+    let ms_per_write = dt_write.as_secs_f64() * 1000.0 / n_writes_actual as f64;
+    println!("  total = {:.2} s  ({:.3} ms/token, {:.0} tok/s)",
+        dt_write.as_secs_f64(), ms_per_write, n_writes_actual as f64 / dt_write.as_secs_f64());
+    println!("  tier counts: cold={} warm={}", kv.cold_count(), kv.warm_count());
+
+    // Time the attention phase.
+    println!("\nphase 2: 3-tier attention");
+    let dq = DeviceBuf::<f32>::from_slice(&q).map_err(|e| anyhow::anyhow!(e))?;
+    let do_part = DeviceBuf::<f32>::new(n_heads_u * n_splits * head_dim).map_err(|e| anyhow::anyhow!(e))?;
+    let dm_part = DeviceBuf::<f32>::new(n_heads_u * n_splits).map_err(|e| anyhow::anyhow!(e))?;
+    let dl_part = DeviceBuf::<f32>::new(n_heads_u * n_splits).map_err(|e| anyhow::anyhow!(e))?;
+    let scaling = 1.0 / (head_dim as f32).sqrt();
+
+    // Warm + measure.
+    launch_attn_partial_superquant(&cache, &kv, dq.raw_ptr(),
+        do_part.raw_ptr(), dm_part.raw_ptr(), dl_part.raw_ptr(),
+        n_heads_u as u32, n_kv_u as u32, head_dim as u32, scaling, n_splits as u32)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    reinstinct_hip::Device(0).synchronize().map_err(|e| anyhow::anyhow!(e))?;
+
+    let attn_iters = 8;
+    let t_attn = std::time::Instant::now();
+    for _ in 0..attn_iters {
+        launch_attn_partial_superquant(&cache, &kv, dq.raw_ptr(),
+            do_part.raw_ptr(), dm_part.raw_ptr(), dl_part.raw_ptr(),
+            n_heads_u as u32, n_kv_u as u32, head_dim as u32, scaling, n_splits as u32)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+    reinstinct_hip::Device(0).synchronize().map_err(|e| anyhow::anyhow!(e))?;
+    let dt_attn = t_attn.elapsed();
+    let ms_per_attn = dt_attn.as_secs_f64() * 1000.0 / attn_iters as f64;
+    println!("  {} iter avg = {:.2} ms/call ({:.1} calls/s)",
+        attn_iters, ms_per_attn, attn_iters as f64 / dt_attn.as_secs_f64());
+    println!("  (one call = full attention over {n_writes_actual} positions across all {n_heads_u} q-heads)");
+
+    // Pull outputs + compute rel L2 vs fp32 reference.
+    let mut o_part = vec![0.0f32; n_heads_u * n_splits * head_dim];
+    let mut m_part = vec![0.0f32; n_heads_u * n_splits];
+    let mut l_part = vec![0.0f32; n_heads_u * n_splits];
+    do_part.copy_to_host(&mut o_part).map_err(|e| anyhow::anyhow!(e))?;
+    dm_part.copy_to_host(&mut m_part).map_err(|e| anyhow::anyhow!(e))?;
+    dl_part.copy_to_host(&mut l_part).map_err(|e| anyhow::anyhow!(e))?;
+
+    // Merge n_splits partials per head into final output. Standard
+    // log-sum-exp merge: stable max across splits, then weighted sum.
+    let mut gpu_out = vec![0.0f32; n_heads_u * head_dim];
+    for h in 0..n_heads_u {
+        let mut mx = f32::NEG_INFINITY;
+        for s in 0..n_splits { mx = mx.max(m_part[h * n_splits + s]); }
+        let mut sum_l = 0.0f32;
+        let mut weighted = vec![0.0f32; head_dim];
+        for s in 0..n_splits {
+            let m_s = m_part[h * n_splits + s];
+            let l_s = l_part[h * n_splits + s];
+            if !m_s.is_finite() || l_s == 0.0 { continue; }
+            let scale = (m_s - mx).exp();
+            sum_l += l_s * scale;
+            for d in 0..head_dim {
+                weighted[d] += scale * o_part[(h * n_splits + s) * head_dim + d];
+            }
+        }
+        let inv_l = if sum_l > 0.0 { 1.0 / sum_l } else { 0.0 };
+        for d in 0..head_dim {
+            gpu_out[h * head_dim + d] = weighted[d] * inv_l;
+        }
+    }
+
+    // CPU reference: pure fp32 attention.
+    println!("\nphase 3: rel_l2 vs pure-fp32 reference");
+    let mut sum_l2_sig = 0.0f64;
+    let mut sum_l2_err = 0.0f64;
+    for h in 0..n_heads_u {
+        let kv_h = h / groups;
+        // Scores
+        let mut scores = vec![0.0f32; n_writes_actual];
+        for i in 0..n_writes_actual {
+            let mut s = 0.0f32;
+            for d in 0..head_dim {
+                s += q[h * head_dim + d] * ref_k[i][kv_h * head_dim + d];
+            }
+            scores[i] = s * scaling;
+        }
+        let m = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let mut e = vec![0.0f32; n_writes_actual];
+        let mut z = 0.0f32;
+        for i in 0..n_writes_actual { e[i] = (scores[i] - m).exp(); z += e[i]; }
+        for i in 0..n_writes_actual { e[i] /= z; }
+        for d in 0..head_dim {
+            let mut a = 0.0f32;
+            for i in 0..n_writes_actual {
+                a += e[i] * ref_v[i][kv_h * head_dim + d];
+            }
+            sum_l2_sig += (a as f64).powi(2);
+            sum_l2_err += ((a - gpu_out[h * head_dim + d]) as f64).powi(2);
+        }
+    }
+    let rel_l2 = (sum_l2_err.sqrt() / sum_l2_sig.sqrt()) as f32;
+    println!("  rel_l2 = {rel_l2:.4}");
+    println!("  (lower is better; expect <0.30 with cold tier dominating)");
+
+    println!("\nphase 4: memory accounting");
+    let sb = reinstinct_runtime::kv_turbo3::slot_bytes(head_dim);
+    let warm_bytes = warm_cap * n_kv_u * head_dim + warm_cap * n_kv_u * 4;
+    let cold_bytes = cold_cap * n_kv_u * sb;
+    let fp16_baseline = (warm_cap + cold_cap) * n_kv_u * head_dim * 2;
+    let int8_baseline = (warm_cap + cold_cap) * (n_kv_u * head_dim + n_kv_u * 4);
+    let total = (warm_bytes + cold_bytes) * 2;                  // ×2 for K + V
+    println!("  per-layer footprint (K + V):");
+    println!("    fp16 (baseline):       {:>10} bytes  ({:.2} MiB)",
+             fp16_baseline * 2, (fp16_baseline * 2) as f64 / (1024.0 * 1024.0));
+    println!("    int8 KV (current):     {:>10} bytes  ({:.2} MiB)",
+             int8_baseline * 2, (int8_baseline * 2) as f64 / (1024.0 * 1024.0));
+    println!("    SuperQuant:            {:>10} bytes  ({:.2} MiB)",
+             total, total as f64 / (1024.0 * 1024.0));
+    println!("    capacity vs fp16:      {:.2}x",
+             (fp16_baseline * 2) as f64 / total as f64);
+    println!("    capacity vs int8:      {:.2}x",
+             (int8_baseline * 2) as f64 / total as f64);
+
+    Ok(())
+}
+
+/// drafter, prefills the prompt on the target (which establishes h_prev
+/// and populates the shared KV the drafter will attend), then runs the
+/// drafter K times printing each proposed token plus the target's own
+/// argmax for comparison.
+fn mtp_draft_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
+                 prompt_text: Option<String>, system: Option<String>, k: usize)
+    -> anyhow::Result<()>
+{
+    use reinstinct_chat::{ChatMessage, Role, format_gemma4};
+    use reinstinct_hip;
+    use reinstinct_model::gemma4::Gemma4Model;
+    use reinstinct_model::gemma4_assistant::Gemma4AssistantModel;
+    use reinstinct_runtime::{KernelCache, gemma4::{GpuGemma4, Gemma4GpuState}};
+    use reinstinct_runtime::gemma4_assistant::GpuGemma4Assistant;
+    use reinstinct_tokenizer::GemmaTokenizer;
+
+    let target_gguf  = GgufFile::open(target_path)?;
+    let drafter_gguf = GgufFile::open(drafter_path)?;
+    let tok = GemmaTokenizer::from_gguf(&target_gguf).map_err(anyhow::Error::msg)?;
+
+    // Render the prompt — chat-template path if --system was given.
+    let prompt: Vec<u32> = if let Some(s) = &system {
+        let user = prompt_text.clone().unwrap_or_default();
+        let msgs = vec![
+            ChatMessage { role: Role::System, content: s.clone() },
+            ChatMessage { role: Role::User,   content: user },
+        ];
+        format_gemma4(&tok, &msgs, true).map_err(anyhow::Error::msg)?
+    } else if let Some(t) = &prompt_text {
+        let mut ids = vec![tok.bos_id];
+        ids.extend(tok.encode(t));
+        ids
+    } else {
+        anyhow::bail!("mtp-draft: pass --prompt or --system/--prompt");
+    };
+
+    println!("target   = {}", target_path.display());
+    println!("drafter  = {}", drafter_path.display());
+    println!("prompt   = {} tokens", prompt.len());
+
+    if reinstinct_hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+    let _dev = reinstinct_hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+
+    let target_model = Gemma4Model::load(&target_gguf).map_err(anyhow::Error::msg)?;
+    let max_seq = prompt.len() + k + 16;
+    let t = std::time::Instant::now();
+    let gm = GpuGemma4::new(&target_model, &target_gguf, &cache, max_seq)
+        .map_err(anyhow::Error::msg)?;
+    println!("target loaded in {:.2} s", t.elapsed().as_secs_f32());
+
+    let drafter_model = Gemma4AssistantModel::load(&drafter_gguf).map_err(anyhow::Error::msg)?;
+    let t = std::time::Instant::now();
+    let drafter = GpuGemma4Assistant::new(&drafter_model, &drafter_gguf, &gm, &cache)
+        .map_err(anyhow::Error::msg)?;
+    println!("drafter loaded in {:.2} s", t.elapsed().as_secs_f32());
+
+    let mut state = Gemma4GpuState::new(&target_model, max_seq).map_err(anyhow::Error::msg)?;
+    state.reset();
+
+    // Prefill the prompt on the target (P-1 positions populate the
+    // shared KV; the final token's forward writes the last KV entry
+    // and leaves `hidden_a` = pre-output_norm hidden at position P-1).
+    let t = std::time::Instant::now();
+    let _ = gm.prefill_forward(&prompt[..prompt.len()-1], &mut state)
+        .map_err(anyhow::Error::msg)?;
+    let last_logits = gm.forward_token(*prompt.last().unwrap(), &mut state)
+        .map_err(anyhow::Error::msg)?;
+    println!("target prefill+1 = {:.1} ms ({} tokens)",
+             t.elapsed().as_secs_f64() * 1e3, prompt.len());
+
+    let mut next = argmax(&last_logits);
+    let pos_const = state.pos - 1;
+    println!("target argmax at position {pos_const}: {} ({:?})",
+             next, tok.decode(&[next]));
+
+    // Seed h_prev from the target's last hidden state.
+    drafter.set_h_prev_from_target(&gm).map_err(anyhow::Error::msg)?;
+
+    println!();
+    println!("--- drafter proposals (k = {k}) ---");
+    let mut prev_tok = next;
+    let mut total = std::time::Duration::ZERO;
+    for i in 0..k {
+        let t = std::time::Instant::now();
+        let logits = drafter.forward_step(&gm, &state, prev_tok, pos_const)
+            .map_err(anyhow::Error::msg)?;
+        let dt = t.elapsed();
+        total += dt;
+        next = argmax(&logits);
+        println!("  step {i}: prev={prev_tok:>6} ({:?})  ->  drafted={next:>6} ({:?})  [{:.2} ms]",
+                 tok.decode(&[prev_tok]),
+                 tok.decode(&[next]),
+                 dt.as_secs_f64() * 1e3);
+        prev_tok = next;
+    }
+    println!("drafter mean: {:.2} ms/step over {k} steps",
+             total.as_secs_f64() * 1e3 / k as f64);
+    Ok(())
+}
+
+use reinstinct_sampling::argmax;
+
+/// Full speculative-decode generation loop (sequential verify). One
+/// round: drafter proposes K tokens; target sequentially verifies via
+/// greedy argmax acceptance; KV cache advances per accepted token; on
+/// rejection target's own argmax replaces the drafted token. Always
+/// commits ≥1 token per round.
+///
+/// With sequential verify the per-round cost is `K·drafter + (n_acc+1)·target`,
+/// vs the K`drafter + 1`target a batched-verify path would hit. This is
+/// a correctness path, not a speed path — see the MTP memory file.
+fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
+               prompt_text: Option<String>, system: Option<String>,
+               k: usize, steps: usize, temperature: f32, seed: u64) -> anyhow::Result<()>
+{
+    use reinstinct_chat::{ChatMessage, Role, format_gemma4};
+    use reinstinct_hip;
+    use reinstinct_model::gemma4::Gemma4Model;
+    use reinstinct_model::gemma4_assistant::Gemma4AssistantModel;
+    use reinstinct_runtime::{KernelCache, gemma4::{GpuGemma4, Gemma4GpuState}};
+    use reinstinct_runtime::gemma4_assistant::GpuGemma4Assistant;
+    use reinstinct_tokenizer::GemmaTokenizer;
+
+    if k == 0 { anyhow::bail!("--k must be >= 1"); }
+    let target_gguf  = GgufFile::open(target_path)?;
+    let drafter_gguf = GgufFile::open(drafter_path)?;
+    let tok = GemmaTokenizer::from_gguf(&target_gguf).map_err(anyhow::Error::msg)?;
+
+    let prompt: Vec<u32> = if let Some(s) = &system {
+        let user = prompt_text.clone().unwrap_or_default();
+        let msgs = vec![
+            ChatMessage { role: Role::System, content: s.clone() },
+            ChatMessage { role: Role::User,   content: user },
+        ];
+        format_gemma4(&tok, &msgs, true).map_err(anyhow::Error::msg)?
+    } else if let Some(t) = &prompt_text {
+        let mut ids = vec![tok.bos_id];
+        ids.extend(tok.encode(t));
+        ids
+    } else {
+        anyhow::bail!("mtp-gen: pass --prompt or --system/--prompt");
+    };
+
+    if reinstinct_hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+    let _dev = reinstinct_hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+
+    let target_model = Gemma4Model::load(&target_gguf).map_err(anyhow::Error::msg)?;
+    let cfg_eos = target_model.config.eos_token_id;
+    let max_seq = prompt.len() + steps + k + 16;
+    let gm = GpuGemma4::new(&target_model, &target_gguf, &cache, max_seq)
+        .map_err(anyhow::Error::msg)?;
+    let drafter_model = Gemma4AssistantModel::load(&drafter_gguf).map_err(anyhow::Error::msg)?;
+    let drafter = GpuGemma4Assistant::new(&drafter_model, &drafter_gguf, &gm, &cache)
+        .map_err(anyhow::Error::msg)?;
+    let mut state = Gemma4GpuState::new(&target_model, max_seq).map_err(anyhow::Error::msg)?;
+    state.reset();
+
+    println!("target = {} ({} tok prompt)", target_path.display(), prompt.len());
+    println!("drafter = {}, K = {k}, steps = {steps}", drafter_path.display());
+
+    // Initial prefill: process all prompt tokens; last forward leaves
+    // `hidden_a` = hidden at last prompt position, and `verify_logits`
+    // = target's prediction for the NEXT (un-validated) position.
+    let t_pf = std::time::Instant::now();
+    let _ = gm.prefill_forward(&prompt[..prompt.len()-1], &mut state)
+        .map_err(anyhow::Error::msg)?;
+    let verify_logits = gm.forward_token(*prompt.last().unwrap(), &mut state)
+        .map_err(anyhow::Error::msg)?;
+    println!("prefill = {:.0} ms", t_pf.elapsed().as_secs_f64() * 1e3);
+
+    // Capture the verify_forward kernel chain into a HIP graph so each
+    // round's verify is one `hipGraphLaunch` instead of ~1600 individual
+    // kernel launches. The captured graph reads per-call `v_tokens` and
+    // `v_base_pos` from device-resident slots that we update host-side
+    // before each replay. Captured at this round's K (graph is K-
+    // specific); rejection-rounds with smaller draft sets fall back to
+    // inline verify_forward. Disable with REINSTINCT_NO_VERIFY_GRAPH=1.
+    let verify_graph = if std::env::var("REINSTINCT_NO_VERIFY_GRAPH").is_err()
+                          && !gm.is_moe()
+    {
+        Some(gm.capture_verify_graph(&state, k).map_err(anyhow::Error::msg)?)
+    } else {
+        // MoE targets dispatch via verify_forward_via_decode (K
+        // sequential forward_token calls); no captured graph needed.
+        None
+    };
+
+    // REINSTINCT_VERIFY_BENCH: warm + time verify_forward(K) across N
+    // calls, print per-call ms. Use to compare verify implementations
+    // head-to-head on a fixed token batch.
+    if std::env::var_os("REINSTINCT_VERIFY_BENCH").is_some() {
+        let n_iter = std::env::var("REINSTINCT_VERIFY_BENCH")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(20usize);
+        // Build a batch of K decode tokens to use as drafted.
+        let snap = state.snapshot().map_err(anyhow::Error::msg)?;
+        let mut cur = argmax(&verify_logits);
+        let mut batch: Vec<u32> = Vec::with_capacity(k);
+        for _ in 0..k {
+            batch.push(cur);
+            let lg = gm.forward_token(cur, &mut state).map_err(anyhow::Error::msg)?;
+            cur = argmax(&lg);
+        }
+        state.restore(&snap).map_err(anyhow::Error::msg)?;
+        // Warm
+        let _ = gm.verify_forward(&batch, &mut state).map_err(anyhow::Error::msg)?;
+        state.restore(&snap).map_err(anyhow::Error::msg)?;
+        // Timed
+        let t = std::time::Instant::now();
+        for _ in 0..n_iter {
+            let _ = gm.verify_forward(&batch, &mut state).map_err(anyhow::Error::msg)?;
+            state.restore(&snap).map_err(anyhow::Error::msg)?;
+        }
+        let el = t.elapsed().as_secs_f64();
+        println!("verify_forward(K={k}) × {n_iter}: {:.2} ms/call (avg)",
+                 el * 1e3 / n_iter as f64);
+        return Ok(());
+    }
+
+    // REINSTINCT_VERIFY_SMOKE: parity check verify_forward(K tokens) vs K
+    // sequential forward_token calls. Both run from the same post-prefill
+    // state via KV-cache snapshot/restore (hidden_a/hidden_b are written
+    // fresh by each forward, so don't need restoring). The K forward_token
+    // results define the ground truth; verify_forward should match.
+    if std::env::var_os("REINSTINCT_VERIFY_SMOKE").is_some() {
+        let snap = state.snapshot().map_err(anyhow::Error::msg)?;
+        let smoke_k = k;
+        // Decode path: K sequential forward_token calls.
+        let mut decode_tokens: Vec<u32> = Vec::with_capacity(smoke_k);
+        let mut decode_logits: Vec<Vec<f32>> = Vec::with_capacity(smoke_k);
+        let mut cur = argmax(&verify_logits);
+        for _ in 0..smoke_k {
+            decode_tokens.push(cur);
+            let lg = gm.forward_token(cur, &mut state).map_err(anyhow::Error::msg)?;
+            cur = argmax(&lg);
+            decode_logits.push(lg);
+        }
+        // Restore KV state, run verify_forward on the K decoded tokens.
+        state.restore(&snap).map_err(anyhow::Error::msg)?;
+        let verify_logits_arr = gm.verify_forward(&decode_tokens, &mut state)
+            .map_err(anyhow::Error::msg)?;
+        println!("\n=== verify-smoke (K={smoke_k}) ===");
+        let mut all_match = true;
+        for i in 0..smoke_k {
+            let a_d = argmax(&decode_logits[i]);
+            let a_v = argmax(&verify_logits_arr[i]);
+            let l1: f32 = decode_logits[i].iter().zip(verify_logits_arr[i].iter())
+                .map(|(a,b)| (a-b).abs()).sum::<f32>() / decode_logits[i].len() as f32;
+            let mx: f32 = decode_logits[i].iter().zip(verify_logits_arr[i].iter())
+                .map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
+            if a_d != a_v { all_match = false; }
+            println!("  pos {i}: decode-argmax={a_d}  verify-argmax={a_v}  \
+                    {}  mean|Δ|={l1:.4}  max|Δ|={mx:.4}",
+                    if a_d == a_v { "MATCH" } else { "MISMATCH" });
+        }
+        println!("smoke result: {}", if all_match { "PASS" } else { "FAIL" });
+        return Ok(());
+    }
+
+    // Hand off to the shared spec-decode loop. The drafter is
+    // conditioned on (prev_tok, h_prev=target_hidden_at_pos); the
+    // natural starting `last_tok` is the FINAL prompt token (per HF:
+    // "input_ids[:, -1:]"), and h_prev gets refreshed per round inside
+    // the loop via `drafter.set_h_prev_from_target(target)`.
+    let t_gen = std::time::Instant::now();
+    // p_min override via env (CLI testing knob); default 0 = disabled
+    // matches the historical behaviour.
+    let p_min_cli = std::env::var("REINSTINCT_DRAFTER_P_MIN").ok()
+        .and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+    // Adaptive-K MTP-disable on sustained low acceptance. Default OFF in
+    // the CLI for measurement work; serve enables by default. Env knob
+    // matches existing p_min style.
+    let adaptive_alpha = std::env::var("REINSTINCT_MTP_MIN_ALPHA").ok()
+        .and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+    let adaptive_window = std::env::var("REINSTINCT_MTP_WINDOW").ok()
+        .and_then(|s| s.parse::<usize>().ok()).unwrap_or(8);
+    let (generated, stats) = reinstinct_runtime::spec_decode::spec_decode_generate(
+        &gm, &drafter, &mut state,
+        verify_graph.as_ref(), k,
+        verify_logits,
+        *prompt.last().unwrap(),
+        cfg_eos,
+        steps, k, temperature, seed,
+        p_min_cli,
+        adaptive_alpha, adaptive_window,
+    ).map_err(anyhow::Error::msg)?;
+
+    let gen_secs = t_gen.elapsed().as_secs_f64();
+    println!();
+    println!("--- generation ---");
+    println!("{}", tok.decode(&generated));
+    println!();
+    println!("generated {} tokens in {:.2} s = {:.1} tok/s",
+             generated.len(), gen_secs, generated.len() as f64 / gen_secs);
+    println!("draft accept rate: {} / {} = {:.0}%",
+             stats.n_accepted, stats.n_drafted, 100.0 * stats.accept_rate());
+    if stats.hit_eos { println!("(hit EOS)"); }
+    if stats.adaptive_disabled {
+        println!("(adaptive-K disabled MTP mid-generation; trailing tokens via plain decode)");
+    }
+    Ok(())
+}
+
+fn inspect(path: &std::path::Path, verbose: bool) -> anyhow::Result<()> {
+    let g = GgufFile::open(path)?;
+    println!("file        = {}", path.display());
+    println!("version     = {}", g.header.version);
+    println!("tensors     = {}", g.header.tensor_count);
+    println!("metadata    = {} kv pairs", g.header.metadata_kv_count);
+    println!("alignment   = {}", g.alignment);
+    println!("data_offset = {} bytes", g.data_section_offset);
+
+    println!("\n--- metadata (scalars only) ---");
+    for (k, v) in &g.metadata {
+        match v {
+            MetaValue::Array { element_type, values } => {
+                println!("  {k} = <{:?}; {} entries>", element_type, values.len());
+            }
+            other => println!("  {k} = {}", short_value(other)),
+        }
+    }
+
+    let mut hist: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for t in &g.tensors {
+        let bytes = t.byte_size().unwrap_or(0);
+        let e = hist.entry(format!("{:?}", t.ggml_type)).or_default();
+        e.0 += 1;
+        e.1 += bytes;
+    }
+    println!("\n--- tensor type histogram ---");
+    let mut total_bytes = 0u64;
+    for (k, (count, bytes)) in &hist {
+        println!("  {k:8} {count:5} tensors  {:>10} MB", bytes / (1024 * 1024));
+        total_bytes += bytes;
+    }
+    println!("  {:8} {:5}           {:>10} MB total",
+        "", "", total_bytes / (1024 * 1024));
+
+    if verbose {
+        println!("\n--- all tensors ---");
+        for t in &g.tensors {
+            println!("  {:50} {:?} {:?}", t.name, t.ggml_type, t.shape());
+        }
+    } else {
+        println!("\n--- top 10 tensors by size ---");
+        let mut by_size: Vec<_> = g.tensors.iter().collect();
+        by_size.sort_by_key(|t| std::cmp::Reverse(t.byte_size().unwrap_or(0)));
+        for t in by_size.iter().take(10) {
+            let mb = t.byte_size().unwrap_or(0) / (1024 * 1024);
+            println!("  {:>4} MB  {:?}  {:?}  {}", mb, t.ggml_type, t.shape(), t.name);
+        }
+    }
+
+    Ok(())
+}
+
+fn model(path: &std::path::Path) -> anyhow::Result<()> {
+    let g = GgufFile::open(path)?;
+    let arch = g.metadata_get("general.architecture")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unknown>");
+    println!("file = {}", path.display());
+    println!("arch = {arch}");
+
+    match arch {
+        "qwen35" | "qwen35moe" => {
+            let m = Qwen35Model::load(&g)?;
+            print_qwen35(&m);
+        }
+        other => {
+            anyhow::bail!("no typed loader for architecture {other:?} yet");
+        }
+    }
+    Ok(())
+}
+
+fn print_qwen35(m: &Qwen35Model) {
+    let c = &m.config;
+    println!("\n--- config ---");
+    println!("  blocks            = {}", c.block_count);
+    println!("  hidden            = {}", c.hidden_size);
+    println!("  ffn               = {}", c.ffn_size);
+    println!("  vocab             = {}", c.vocab_size);
+    println!("  context           = {}", c.context_length);
+    println!("  rms_eps           = {:.2e}", c.rms_norm_eps);
+    println!("  tied_embeddings   = {}", c.tied_embeddings);
+    println!("  full attn:");
+    println!("    n_heads         = {}", c.attn_n_heads);
+    println!("    n_kv_heads      = {}", c.attn_n_kv_heads);
+    println!("    head_dim        = {}", c.attn_head_dim);
+    println!("  linear attn (GDN):");
+    println!("    value_dim       = {}", c.gdn_value_dim);
+    println!("    n_heads         = {}", c.gdn_n_heads);
+    println!("    head_dim        = {}", c.gdn_head_dim);
+    println!("    conv_kernel     = {}", c.gdn_conv_kernel);
+    println!("  rope:");
+    println!("    freq_base       = {}", c.rope_freq_base);
+    println!("    rotated dims    = {} of {}", c.rope_dim_count, c.attn_head_dim);
+    println!("    mrope sections  = {:?}", c.rope_dim_sections);
+    println!("  layer schedule    = full attention every {} blocks", c.full_attention_interval);
+    if let Some(moe) = &c.moe {
+        println!("  MoE FFN:");
+        println!("    experts         = {} ({} used/token)", moe.n_expert, moe.n_expert_used);
+        println!("    expert_ff       = {}", moe.expert_ff);
+        println!("    shared_expert_ff= {}", moe.shared_expert_ff);
+    }
+
+    println!("\n--- block schedule ---");
+    for (i, &k) in m.block_kinds.iter().enumerate() {
+        let tag = match k {
+            BlockKind::LinearAttention => "L",
+            BlockKind::FullAttention   => "F",
+            BlockKind::NextN           => "N",
+        };
+        print!("  {i:2}:{tag}");
+        if (i + 1) % 8 == 0 { println!(); }
+    }
+    if m.block_kinds.len() % 8 != 0 { println!(); }
+
+    let n_full = m.block_kinds.iter().filter(|k| **k == BlockKind::FullAttention).count();
+    let n_lin  = m.block_kinds.len() - n_full;
+    println!("\n  total = {} linear, {} full", n_lin, n_full);
+}
+
+fn short_value(v: &MetaValue) -> String {
+    match v {
+        MetaValue::String(s) if s.len() > 80 => format!("{:?}…", &s[..80]),
+        MetaValue::String(s) => format!("{s:?}"),
+        MetaValue::U8(x)  => x.to_string(),  MetaValue::I8(x)  => x.to_string(),
+        MetaValue::U16(x) => x.to_string(),  MetaValue::I16(x) => x.to_string(),
+        MetaValue::U32(x) => x.to_string(),  MetaValue::I32(x) => x.to_string(),
+        MetaValue::U64(x) => x.to_string(),  MetaValue::I64(x) => x.to_string(),
+        MetaValue::F32(x) => format!("{x:.6}"),
+        MetaValue::F64(x) => format!("{x:.6}"),
+        MetaValue::Bool(b) => b.to_string(),
+        MetaValue::Array { element_type, values } => {
+            format!("<{:?}; {} entries>", element_type, values.len())
+        }
+    }
+}

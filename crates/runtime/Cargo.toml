@@ -1,0 +1,21 @@
+[package]
+name = "reinstinct-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+reinstinct-hip = { path = "../hip" }
+reinstinct-gguf = { path = "../gguf" }
+reinstinct-model = { path = "../model" }
+reinstinct-quant = { path = "../quant" }
+reinstinct-sampling = { path = "../sampling" }
+reinstinct-cpu = { path = "../cpu" }
+xxhash-rust.workspace = true
+bytemuck.workspace = true
+half.workspace = true
+tracing.workspace = true
+anyhow = "1.0"
+rayon.workspace = true
+
+[dev-dependencies]
+reinstinct-cpu = { path = "../cpu" }

@@ -1,0 +1,15 @@
+[package]
+name = "reinstinct-serve"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+reinstinct-chat = { path = "../chat" }
+reinstinct-sampling = { path = "../sampling" }
+reinstinct-gguf = { path = "../gguf" }
+reinstinct-runtime = { path = "../runtime" }
+reinstinct-model = { path = "../model" }
+reinstinct-hip = { path = "../hip" }
+reinstinct-tokenizer = { path = "../tokenizer" }
+serde_json.workspace = true
+tracing.workspace = true
